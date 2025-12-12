@@ -1,6 +1,7 @@
 include README.md
 include iris.cu
 include iris_binding.cu
+include iris_params.h
 recursive-include src *.py
 recursive-include src *.typed
 recursive-include tests *.py

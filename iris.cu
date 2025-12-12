@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "iris_params.h"
+
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
     cudaError_t _err = (call);                                                 \
@@ -14,51 +16,6 @@
       return;                                                                  \
     }                                                                          \
   } while (0)
-
-// ----------------- Problem params -----------------
-
-constexpr int K_BITS = 12800;
-constexpr int K_WORDS = K_BITS / 32; // 400
-constexpr int K_CHUNK_BITS = 256;
-constexpr int K_CHUNK_WORDS = K_CHUNK_BITS / 32; // 8
-constexpr int K_CHUNKS = K_BITS / K_CHUNK_BITS;  // 50
-
-// Shift range for minimum FHD (theta-roll steps, matches np.roll(axis=1))
-constexpr int MAX_SHIFT = 15;
-constexpr int NUM_SHIFTS = 2 * MAX_SHIFT + 1; // 31
-
-// Iris layout in Python: (16, 200, 2, 2). Rolling axis=1 by 1 step rotates
-// 16*2*2 = 64 bits = 2 uint32 words in our packed representation.
-constexpr int WORDS_PER_THETA_SHIFT = 2;
-
-// Extended chunk size for B to handle shifts (need 1 extra word on each side)
-constexpr int K_CHUNK_WORDS_EXT = K_CHUNK_WORDS + 2; // 10
-
-// Warp MMA tile
-constexpr int WMMA_M = 16; // tile rows
-constexpr int WMMA_N = 8;  // tile cols
-
-// ----------------- CTA tile config -----------------
-
-#ifndef BLOCK_M_VAL
-#define BLOCK_M_VAL 192
-#endif
-#ifndef BLOCK_N_VAL
-#define BLOCK_N_VAL 64
-#endif
-
-constexpr int BLOCK_M = BLOCK_M_VAL;
-constexpr int BLOCK_N = BLOCK_N_VAL;
-
-constexpr int TILES_M_PER_WARP = 2;
-constexpr int TILES_N_PER_WARP = 4;
-
-constexpr int TILES_M = BLOCK_M / WMMA_M;
-constexpr int TILES_N = BLOCK_N / WMMA_N;
-
-constexpr int WARPS_PER_ROW = TILES_M / TILES_M_PER_WARP;
-constexpr int WARPS_PER_COL = TILES_N / TILES_N_PER_WARP;
-constexpr int WARPS_PER_BLOCK = WARPS_PER_ROW * WARPS_PER_COL;
 
 static_assert(BLOCK_M % (WMMA_M * TILES_M_PER_WARP) == 0, "BLOCK_M constraint");
 static_assert(BLOCK_N % (WMMA_N * TILES_N_PER_WARP) == 0, "BLOCK_N constraint");
@@ -371,4 +328,27 @@ __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
   if (idx < M * K_WORDS) {
     premasked[idx] = data[idx] & mask[idx];
   }
+}
+
+// C++/Python-facing launcher (keeps launch config and smem sizing in one
+// place).
+extern "C" void launch_masked_hamming_cuda(
+    const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
+    float *dD, bool write_output, bool collect_pairs, float threshold,
+    uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
+    cudaStream_t stream) {
+  int total = M * K_WORDS;
+  preprocess_kernel<<<(total + 255) / 256, 256, 0, stream>>>(dData, dMask,
+                                                             dPremasked, M);
+
+  dim3 grid((M + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+  dim3 block(WARPS_PER_BLOCK * 32);
+
+  size_t smem =
+      2 * (2 * BLOCK_M * K_CHUNK_WORDS + 2 * BLOCK_N * K_CHUNK_WORDS_EXT) *
+      sizeof(uint32_t);
+
+  min_hamming_kernel<<<grid, block, smem, stream>>>(
+      dPremasked, dMask, M, dD, write_output, collect_pairs, threshold, dPairs,
+      dMatchCount, max_pairs);
 }

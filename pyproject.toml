@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iris-hamming"
+version = "0.1.0"
+description = "CUDA/TensorCore masked hamming distance for IrisCode (PyTorch extension)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "torch"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
