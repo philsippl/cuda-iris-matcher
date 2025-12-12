@@ -1,20 +1,9 @@
 import torch
-from torch.utils.cpp_extension import load
 import os
 import time
 import numpy as np
 
-
-def build_extension():
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    ext = load(
-        name="iris_ext",
-        sources=[os.path.join(this_dir, "iris_binding.cu"),
-                 os.path.join(this_dir, "iris.cu")],
-        extra_cuda_cflags=["-O3"],
-        verbose=False,
-    )
-    return ext
+import iris_hamming as ih
 
 
 def main():
@@ -26,30 +15,24 @@ def main():
     code = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
     mask = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
 
-    # Pack to int32 words (400 words = 12800 bits) in theta-major order so that
-    # np.roll(axis=2) by 1 corresponds to rotating by 64 bits (=2 uint32 words).
-    def pack_theta_major(bits_u8: np.ndarray) -> np.ndarray:
-        # bits_u8: (M, 16, 200, 2, 2)
-        b = np.transpose(bits_u8, (0, 2, 1, 3, 4)).reshape(M, -1)  # (M, 12800)
-        packed_bytes = np.packbits(b, axis=1, bitorder="little")  # (M, 1600)
-        words_u32 = packed_bytes.view("<u4")  # (M, 400)
-        return words_u32.view("<i4")  # reinterpret as int32 for torch
-
-    data_words = pack_theta_major(code)
-    mask_words = pack_theta_major(mask)
+    data_words = ih.pack_theta_major(code)
+    mask_words = ih.pack_theta_major(mask)
 
     data_t = torch.from_numpy(data_words).to(device=device)
     mask_t = torch.from_numpy(mask_words).to(device=device)
-
-    ext = build_extension()
 
     # Single run (GPU) with output + pair collection
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     start_event.record()
-    D, pairs, match_count = ext.masked_hamming_cuda(
-        data_t, mask_t, True, True, 0.5, 1 << 16
+    D, pairs, match_count = ih.masked_hamming_cuda(
+        data_t,
+        mask_t,
+        write_output=True,
+        collect_pairs=True,
+        threshold=0.5,
+        max_pairs=1 << 16,
     )
     end_event.record()
     torch.cuda.synchronize()
@@ -113,8 +96,13 @@ def main():
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     # No output matrix, no pair collection for perf timing.
-    _D, _pairs, _count = ext.masked_hamming_cuda(
-        data_perf, mask_perf, False, False, 1.0, 0
+    _D, _pairs, _count = ih.masked_hamming_cuda(
+        data_perf,
+        mask_perf,
+        write_output=False,
+        collect_pairs=False,
+        threshold=1.0,
+        max_pairs=0,
     )
     end_event.record()
     torch.cuda.synchronize()

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtualenvs
+.venv/
+venv/
+ENV/
+
+# PyTorch / CUDA extension build artifacts
+*.so
+*.o
+*.a
+*.d
+*.cu.o
+*.cuda.o
+*.cpp.o
+*.o.d
+
+# Torch JIT extension cache
+.cache/torch_extensions/
+
+# Nsight / profiling outputs
+*.nsys-rep
+*.qdstrm
+*.sqlite
+*.qdrep
+*.csv
+
+# IDE/editor
+.vscode/
+.idea/
+
+
