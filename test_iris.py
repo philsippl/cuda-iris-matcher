@@ -4,7 +4,7 @@ import time
 import multiprocessing as mp
 import numpy as np
 
-import iris_hamming as ih
+import cuda_iris_matcher as ih
 
 
 def _perf_worker(

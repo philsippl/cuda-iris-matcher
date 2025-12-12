@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 def get_ext_modules():
-    # Build the extension as iris_hamming._C
+    # Build the extension as cuda_iris_matcher._C
     sources = [
         "iris_binding.cu",
         "iris.cu",
@@ -17,7 +17,7 @@ def get_ext_modules():
 
     return [
         CUDAExtension(
-            name="iris_hamming._C",
+            name="cuda_iris_matcher._C",
             sources=sources,
             extra_compile_args={"cxx": extra_cflags, "nvcc": extra_cuda_cflags},
         )
@@ -25,7 +25,7 @@ def get_ext_modules():
 
 
 setup(
-    name="iris-hamming",
+    name="cuda-iris-matcher",
     version="0.1.0",
     package_dir={"": "src"},
     packages=find_packages("src"),

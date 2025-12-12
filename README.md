@@ -1,4 +1,4 @@
-## iris-hamming
+## cuda-iris-matcher
 
 PyTorch CUDA extension for masked fractional Hamming distance on IrisCode-like bit tensors.
 
@@ -12,7 +12,7 @@ pip install -e .
 
 ```python
 import torch
-import iris_hamming as ih
+import cuda_iris_matcher as ih
 
 data = torch.randint(0, 2**31, (1024, 400), dtype=torch.int32, device="cuda")
 mask = torch.full((1024, 400), 0x7FFFFFFF, dtype=torch.int32, device="cuda")

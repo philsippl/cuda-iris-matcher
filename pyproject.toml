@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel", "torch", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iris-hamming"
+name = "cuda-iris-matcher"
 version = "0.1.0"
 description = "CUDA/TensorCore masked hamming distance for IrisCode (PyTorch extension)"
 readme = "README.md"

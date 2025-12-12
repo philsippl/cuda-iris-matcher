@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import pytest
 
-import iris_hamming as ih
+import cuda_iris_matcher as ih
 
 
 def test_matches_numpy_roll():
