@@ -1,19 +1,36 @@
 NVCC ?= nvcc
 NVCCFLAGS ?= -O3 -arch=sm_89
 
-TARGET ?= iris
+# Main library object
 SRCS := iris.cu
+OBJS := iris.o
 
-all: $(TARGET)
+# Benchmark binary
+BENCHMARK := benchmark
 
-$(TARGET): $(SRCS)
-	$(NVCC) $(NVCCFLAGS) $(SRCS) -o $(TARGET)
+all: $(BENCHMARK)
 
-run: $(TARGET)
-	./$(TARGET)
+# Compile iris.cu to object file (reusable)
+iris.o: iris.cu iris_params.h
+	$(NVCC) $(NVCCFLAGS) -dc -o $@ iris.cu
+
+# Compile and link benchmark
+$(BENCHMARK): benchmark.cu iris.o iris_params.h
+	$(NVCC) $(NVCCFLAGS) -o $@ benchmark.cu iris.o
+
+run: $(BENCHMARK)
+	./$(BENCHMARK)
+
+# Quick benchmark with smaller dataset
+quick: $(BENCHMARK)
+	./$(BENCHMARK) 5000 3 10
+
+# Full benchmark
+bench: $(BENCHMARK)
+	./$(BENCHMARK) 10000 5 20
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(BENCHMARK) $(OBJS)
 
-.PHONY: all run clean
+.PHONY: all run quick bench clean
 

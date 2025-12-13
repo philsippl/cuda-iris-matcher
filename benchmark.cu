@@ -1,0 +1,229 @@
+/**
+ * Standalone CUDA benchmark for iris kernel performance testing.
+ * Compile with: make benchmark
+ * Run with: ./benchmark [M] [warmup_iters] [bench_iters]
+ *
+ * Defaults: M=10000, warmup=5, bench=20
+ */
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include "iris_params.h"
+
+// External launcher from iris.cu
+extern "C" void launch_masked_hamming_cuda(
+    const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
+    float *dD, bool write_output, bool collect_pairs, float threshold,
+    uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
+    cudaStream_t stream);
+
+#define CHECK_CUDA(call)                                                       \
+  do {                                                                         \
+    cudaError_t _err = (call);                                                 \
+    if (_err != cudaSuccess) {                                                 \
+      fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call, __FILE__,         \
+              __LINE__, cudaGetErrorString(_err));                             \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+void fill_random(uint32_t *ptr, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    ptr[i] = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+  }
+}
+
+void print_gpu_info() {
+  int device;
+  cudaDeviceProp prop;
+  CHECK_CUDA(cudaGetDevice(&device));
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+
+  printf("=== GPU Info ===\n");
+  printf("Device: %s\n", prop.name);
+  printf("Compute capability: %d.%d\n", prop.major, prop.minor);
+  printf("SM count: %d\n", prop.multiProcessorCount);
+  printf("Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
+  printf("Memory bandwidth: %.0f GB/s\n",
+         2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8) / 1e9);
+  printf("\n");
+}
+
+void print_kernel_config(int M) {
+  printf("=== Kernel Config ===\n");
+  printf("M (samples): %d\n", M);
+  printf("K_BITS: %d, K_WORDS: %d\n", K_BITS, K_WORDS);
+  printf("Block size: BLOCK_M=%d, BLOCK_N=%d\n", BLOCK_M, BLOCK_N);
+  printf("Warps per block: %d\n", WARPS_PER_BLOCK);
+  printf("Tiles per warp: %dx%d\n", TILES_M_PER_WARP, TILES_N_PER_WARP);
+  printf("K chunks: %d (chunk words: %d)\n", K_CHUNKS, K_CHUNK_WORDS);
+  printf("Shift range: [-%d, +%d] (%d shifts)\n", MAX_SHIFT, MAX_SHIFT,
+         NUM_SHIFTS);
+
+  dim3 grid((M + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+  size_t smem =
+      2 * (2 * BLOCK_M * K_CHUNK_WORDS + 2 * BLOCK_N * K_CHUNK_WORDS_EXT) *
+      sizeof(uint32_t);
+  printf("Grid: %d x %d = %d blocks\n", grid.x, grid.y, grid.x * grid.y);
+  printf("Shared memory per block: %zu bytes\n", smem);
+  printf("\n");
+}
+
+int main(int argc, char **argv) {
+  // Parse args
+  int M = (argc > 1) ? atoi(argv[1]) : 10000;
+  int warmup_iters = (argc > 2) ? atoi(argv[2]) : 5;
+  int bench_iters = (argc > 3) ? atoi(argv[3]) : 20;
+
+  printf("Iris Kernel Benchmark\n");
+  printf("=====================\n\n");
+
+  print_gpu_info();
+  print_kernel_config(M);
+
+  printf("=== Benchmark Settings ===\n");
+  printf("Warmup iterations: %d\n", warmup_iters);
+  printf("Benchmark iterations: %d\n", bench_iters);
+  printf("\n");
+
+  srand(42);
+
+  // Allocate host memory
+  size_t data_size = (size_t)M * K_WORDS * sizeof(uint32_t);
+  uint32_t *h_data = (uint32_t *)malloc(data_size);
+  uint32_t *h_mask = (uint32_t *)malloc(data_size);
+
+  printf("Generating random data... ");
+  fflush(stdout);
+  fill_random(h_data, M * K_WORDS);
+  fill_random(h_mask, M * K_WORDS);
+  printf("done\n");
+
+  // Allocate device memory
+  uint32_t *d_data, *d_mask, *d_premasked;
+  float *d_D = nullptr; // Don't allocate full distance matrix
+  uint2 *d_pairs;
+  unsigned int *d_match_count;
+
+  unsigned int max_pairs = 1000000;
+
+  CHECK_CUDA(cudaMalloc(&d_data, data_size));
+  CHECK_CUDA(cudaMalloc(&d_mask, data_size));
+  CHECK_CUDA(cudaMalloc(&d_premasked, data_size));
+  CHECK_CUDA(cudaMalloc(&d_pairs, max_pairs * sizeof(uint2)));
+  CHECK_CUDA(cudaMalloc(&d_match_count, sizeof(unsigned int)));
+
+  printf("Copying data to GPU... ");
+  fflush(stdout);
+  CHECK_CUDA(cudaMemcpy(d_data, h_data, data_size, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_mask, h_mask, data_size, cudaMemcpyHostToDevice));
+  printf("done\n\n");
+
+  // Create events for timing
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  cudaStream_t stream;
+  CHECK_CUDA(cudaStreamCreate(&stream));
+
+  // Warmup
+  printf("Warmup (%d iterations)... ", warmup_iters);
+  fflush(stdout);
+  for (int i = 0; i < warmup_iters; i++) {
+    CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, d_D,
+                               false, // write_output
+                               true,  // collect_pairs
+                               0.3f,  // threshold
+                               d_pairs, d_match_count, max_pairs, stream);
+  }
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  printf("done\n\n");
+
+  // Benchmark
+  printf("=== Benchmarking ===\n");
+
+  double *times = (double *)malloc(bench_iters * sizeof(double));
+  double total_time = 0.0;
+
+  for (int i = 0; i < bench_iters; i++) {
+    CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
+
+    CHECK_CUDA(cudaEventRecord(start, stream));
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, d_D,
+                               false, // write_output
+                               true,  // collect_pairs
+                               0.3f,  // threshold
+                               d_pairs, d_match_count, max_pairs, stream);
+    CHECK_CUDA(cudaEventRecord(stop, stream));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    times[i] = ms;
+    total_time += ms;
+
+    printf("Iter %2d: %.3f ms\n", i + 1, ms);
+  }
+
+  // Calculate statistics
+  double mean = total_time / bench_iters;
+  double variance = 0.0;
+  double min_time = times[0], max_time = times[0];
+
+  for (int i = 0; i < bench_iters; i++) {
+    variance += (times[i] - mean) * (times[i] - mean);
+    if (times[i] < min_time)
+      min_time = times[i];
+    if (times[i] > max_time)
+      max_time = times[i];
+  }
+  variance /= bench_iters;
+  double stddev = sqrt(variance);
+
+  // Calculate performance metrics
+  // Lower triangle comparisons: M*(M-1)/2
+  double comparisons = (double)M * (M - 1) / 2.0;
+  // Each comparison does NUM_SHIFTS shifts, K_CHUNKS chunks
+  // Each chunk: 3 MMA ops (16x8x256), each MMA is 16*8*256 = 32768 ops
+  double mma_ops_per_comparison = NUM_SHIFTS * K_CHUNKS * 3 * 16 * 8 * 256;
+  double total_ops = comparisons * mma_ops_per_comparison;
+  double tops = total_ops / (mean * 1e-3) / 1e12;
+
+  // Pairs per second (in millions) - matches Python script format
+  double pairs_per_s_m = comparisons / (mean * 1e-3) / 1e6;
+
+  printf("\n=== Results ===\n");
+  printf("Time (mean ± std): %.3f ± %.3f ms\n", mean, stddev);
+  printf("Time (min / max): %.3f / %.3f ms\n", min_time, max_time);
+  printf("Pairs/s: %.3f M (31 shifts)\n", pairs_per_s_m);
+  printf("Throughput: %.2f TOPS (tensor ops)\n", tops);
+
+  // Get match count for verification
+  unsigned int h_match_count;
+  CHECK_CUDA(cudaMemcpy(&h_match_count, d_match_count, sizeof(unsigned int),
+                        cudaMemcpyDeviceToHost));
+  printf("Matches found (last iter, threshold=0.3): %u\n", h_match_count);
+
+  // Cleanup
+  free(times);
+  free(h_data);
+  free(h_mask);
+  CHECK_CUDA(cudaFree(d_data));
+  CHECK_CUDA(cudaFree(d_mask));
+  CHECK_CUDA(cudaFree(d_premasked));
+  CHECK_CUDA(cudaFree(d_pairs));
+  CHECK_CUDA(cudaFree(d_match_count));
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  CHECK_CUDA(cudaStreamDestroy(stream));
+
+  printf("\nBenchmark complete.\n");
+  return 0;
+}
