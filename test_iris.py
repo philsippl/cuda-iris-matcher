@@ -135,13 +135,14 @@ def main():
     print(f"Kernel compute: {elapsed_ms:.3f} ms, pairs/s={pairs_per_s:.3f} M (31 shifts)")
 
     # --- Timing: Copying back results ---
+    # Note: pairs and match_count are already pinned CPU tensors (async copied)
     t0_copy = time.perf_counter()
     D_cpu = D.cpu()
-    count = match_count.cpu().item() if match_count.numel() else 0
-    pairs_cpu = pairs.cpu() if count > 0 else None
+    count = match_count.item() if match_count.numel() else 0
+    pairs_cpu = pairs if count > 0 else None
     t1_copy = time.perf_counter()
     copy_ms = (t1_copy - t0_copy) * 1e3
-    print(f"Copying back results: {copy_ms:.3f} ms")
+    print(f"Copying back results: {copy_ms:.3f} ms (D only; pairs already on CPU)")
 
     # Summary
     total_ms = pack_ms + load_ms + elapsed_ms + copy_ms

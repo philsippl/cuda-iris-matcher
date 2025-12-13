@@ -37,11 +37,26 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
   if (write_output) {
     D = torch::zeros({M, M}, opts_float);
   }
-  torch::Tensor pairs;
-  torch::Tensor match_count;
+
+  // GPU buffers for kernel output
+  torch::Tensor pairs_gpu;
+  torch::Tensor match_count_gpu;
+  // Pinned CPU buffers for async copy destination
+  torch::Tensor pairs_cpu;
+  torch::Tensor match_count_cpu;
+
   if (collect_pairs && max_pairs > 0) {
-    pairs = torch::zeros({max_pairs, 2}, opts_int);
-    match_count = torch::zeros({1}, opts_int);
+    // GPU buffers for kernel to write to
+    pairs_gpu = torch::zeros({max_pairs, 2}, opts_int);
+    match_count_gpu = torch::zeros({1}, opts_int);
+
+    // Pinned CPU buffers for async copy
+    auto cpu_opts = torch::TensorOptions()
+                        .device(torch::kCPU)
+                        .dtype(torch::kInt32)
+                        .pinned_memory(true);
+    pairs_cpu = torch::zeros({max_pairs, 2}, cpu_opts);
+    match_count_cpu = torch::zeros({1}, cpu_opts);
   }
 
   auto stream = at::cuda::getDefaultCUDAStream();
@@ -52,14 +67,24 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
       write_output ? D.data_ptr<float>() : nullptr, write_output, collect_pairs,
       (float)threshold,
       collect_pairs && max_pairs > 0
-          ? reinterpret_cast<uint2 *>(pairs.data_ptr<int>())
+          ? reinterpret_cast<uint2 *>(pairs_gpu.data_ptr<int>())
           : nullptr,
       collect_pairs && max_pairs > 0
-          ? reinterpret_cast<unsigned int *>(match_count.data_ptr<int>())
+          ? reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>())
           : nullptr,
       (unsigned int)max_pairs, stream);
 
-  return {D, pairs, match_count};
+  // Async copy results to pinned host memory
+  if (collect_pairs && max_pairs > 0) {
+    cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+                    sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(pairs_cpu.data_ptr(), pairs_gpu.data_ptr(),
+                    max_pairs * 2 * sizeof(int), cudaMemcpyDeviceToHost,
+                    stream);
+  }
+
+  // Return CPU tensors - caller must sync stream before reading
+  return {D, pairs_cpu, match_count_cpu};
 }
 
 torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
