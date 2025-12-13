@@ -16,6 +16,9 @@ def masked_hamming_cuda(
     max_pairs: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
+    Compute minimum fractional hamming distance for all pairs within a single set.
+    Only the lower triangle (i > j) is computed.
+
     data/mask: CUDA int32 contiguous tensors of shape [M, 400].
 
     Returns:
@@ -24,6 +27,33 @@ def masked_hamming_cuda(
       - match_count: [1] int32 (or an empty tensor if collect_pairs=False)
     """
     return _C.masked_hamming_cuda(data, mask, write_output, collect_pairs, threshold, max_pairs)
+
+
+def masked_hamming_ab_cuda(
+    data_a: torch.Tensor,
+    mask_a: torch.Tensor,
+    data_b: torch.Tensor,
+    mask_b: torch.Tensor,
+    write_output: bool = False,
+    collect_pairs: bool = False,
+    threshold: float = 1.0,
+    max_pairs: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute minimum fractional hamming distance between two different sets A and B.
+    Computes the full M_A x M_B matrix (not just lower triangle).
+
+    data_a/mask_a: CUDA int32 contiguous tensors of shape [M_A, 400].
+    data_b/mask_b: CUDA int32 contiguous tensors of shape [M_B, 400].
+
+    Returns:
+      - D: [M_A, M_B] float32 (or an empty tensor if write_output=False)
+      - pairs: [max_pairs, 2] int32 (or an empty tensor if collect_pairs=False)
+      - match_count: [1] int32 (or an empty tensor if collect_pairs=False)
+    """
+    return _C.masked_hamming_ab_cuda(
+        data_a, mask_a, data_b, mask_b, write_output, collect_pairs, threshold, max_pairs
+    )
 
 
 def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:

@@ -491,3 +491,283 @@ extern "C" void launch_masked_hamming_cuda(
       dPremasked, dMask, M, dD, write_output, collect_pairs, threshold, dPairs,
       dMatchCount, max_pairs);
 }
+
+// ----------------- A vs B kernel: compares all pairs between two sets
+// -----------------
+//
+// Unlike the self-comparison kernel which only computes lower triangle (i > j),
+// this kernel computes the full M_A x M_B rectangle.
+
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
+    min_hamming_ab_kernel(const uint32_t *__restrict__ premasked_A,
+                          const uint32_t *__restrict__ mask_A,
+                          const uint32_t *__restrict__ premasked_B,
+                          const uint32_t *__restrict__ mask_B, int M_A, int M_B,
+                          float *__restrict__ D, bool write_output,
+                          bool collect_pairs, float threshold,
+                          uint2 *__restrict__ pairs, unsigned int *match_count,
+                          unsigned int max_pairs) {
+  int warp_id = threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  int group = lane >> 2;
+  int tid = lane & 3;
+
+  int cta_row = blockIdx.y;
+  int cta_col = blockIdx.x;
+  int block_row_start = cta_row * BLOCK_M;
+  int block_col_start = cta_col * BLOCK_N;
+
+  // No triangle skip for A vs B - compute full rectangle
+  if (block_row_start >= M_A || block_col_start >= M_B)
+    return;
+
+  extern __shared__ uint32_t smem[];
+  size_t stride_A = BLOCK_M * K_CHUNK_WORDS;
+  size_t stride_B_ext = BLOCK_N * K_CHUNK_WORDS_EXT;
+
+  uint32_t *A_pm_smem = smem;
+  uint32_t *A_m_smem = A_pm_smem + 2 * stride_A;
+  uint32_t *B_pm_smem = A_m_smem + 2 * stride_A;
+  uint32_t *B_m_smem = B_pm_smem + 2 * stride_B_ext;
+
+  auto A_pm_stage = [&](int s) { return A_pm_smem + s * stride_A; };
+  auto A_m_stage = [&](int s) { return A_m_smem + s * stride_A; };
+  auto B_pm_stage = [&](int s) { return B_pm_smem + s * stride_B_ext; };
+  auto B_m_stage = [&](int s) { return B_m_smem + s * stride_B_ext; };
+
+  int warp_row = warp_id / WARPS_PER_COL;
+  int warp_col = warp_id % WARPS_PER_COL;
+  int tile_m_base = warp_row * TILES_M_PER_WARP;
+  int tile_n_base = warp_col * TILES_N_PER_WARP;
+
+  // Min FHD tracker per output element
+  float min_fhd[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
+#pragma unroll
+  for (int tm = 0; tm < TILES_M_PER_WARP; ++tm)
+#pragma unroll
+    for (int tn = 0; tn < TILES_N_PER_WARP; ++tn)
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        min_fhd[tm][tn][r] = 2.0f;
+
+  // Lambda to load A chunks (from set A)
+  auto load_chunk_A = [&](uint32_t *dst, const uint32_t *src, int block_start,
+                          int chunk_word, int M_limit) {
+    int num_words = BLOCK_M * K_CHUNK_WORDS;
+    for (int idx4 = threadIdx.x; idx4 * 4 < num_words; idx4 += blockDim.x) {
+      int idx = idx4 * 4;
+      int r = idx / K_CHUNK_WORDS;
+      int w = idx % K_CHUNK_WORDS;
+      int g_row = block_start + r;
+      if (g_row < M_limit) {
+        __pipeline_memcpy_async(dst + idx,
+                                src + g_row * K_WORDS + chunk_word + w, 16);
+      } else {
+        dst[idx] = dst[idx + 1] = dst[idx + 2] = dst[idx + 3] = 0;
+      }
+    }
+  };
+
+  // Lambda to load B chunks with extended halo (from set B)
+  auto load_chunk_B_ext = [&](uint32_t *dst, const uint32_t *src,
+                              int block_start, int chunk_idx, int shift_words,
+                              int M_limit) {
+    int chunk_word = chunk_idx * K_CHUNK_WORDS;
+    int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
+
+    for (int idx = threadIdx.x; idx < num_elems; idx += blockDim.x) {
+      int r = idx / K_CHUNK_WORDS_EXT;
+      int w = idx % K_CHUNK_WORDS_EXT;
+      int g_row = block_start + r;
+      int g_word = chunk_word + w - 1 + shift_words;
+
+      if (g_row < M_limit) {
+        int gw = g_word % K_WORDS;
+        if (gw < 0)
+          gw += K_WORDS;
+        const uint32_t *src_ptr = src + g_row * K_WORDS + gw;
+        __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
+      } else {
+        dst[idx] = 0;
+      }
+    }
+  };
+
+  // Process one theta-roll shift at a time
+  for (int shift = -MAX_SHIFT; shift <= MAX_SHIFT; ++shift) {
+    int shift_words = shift * WORDS_PER_THETA_SHIFT;
+    int32_t c1_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
+    int32_t c2_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
+    int32_t c3_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
+
+#pragma unroll
+    for (int tm = 0; tm < TILES_M_PER_WARP; ++tm)
+#pragma unroll
+      for (int tn = 0; tn < TILES_N_PER_WARP; ++tn)
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          c1_frag[tm][tn][r] = 0;
+          c2_frag[tm][tn][r] = 0;
+          c3_frag[tm][tn][r] = 0;
+        }
+
+    int stage = 0;
+    {
+      load_chunk_A(A_pm_stage(stage), premasked_A, block_row_start, 0, M_A);
+      load_chunk_A(A_m_stage(stage), mask_A, block_row_start, 0, M_A);
+      load_chunk_B_ext(B_pm_stage(stage), premasked_B, block_col_start, 0,
+                       shift_words, M_B);
+      load_chunk_B_ext(B_m_stage(stage), mask_B, block_col_start, 0,
+                       shift_words, M_B);
+      __pipeline_commit();
+      __pipeline_wait_prior(0);
+      __syncthreads();
+    }
+
+    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+      uint32_t *A_pm_buf = A_pm_stage(stage);
+      uint32_t *A_m_buf = A_m_stage(stage);
+      uint32_t *B_pm_buf = B_pm_stage(stage);
+      uint32_t *B_m_buf = B_m_stage(stage);
+
+      int next_stage = stage ^ 1;
+      if (kc + 1 < K_CHUNKS) {
+        load_chunk_A(A_pm_stage(next_stage), premasked_A, block_row_start,
+                     (kc + 1) * K_CHUNK_WORDS, M_A);
+        load_chunk_A(A_m_stage(next_stage), mask_A, block_row_start,
+                     (kc + 1) * K_CHUNK_WORDS, M_A);
+        load_chunk_B_ext(B_pm_stage(next_stage), premasked_B, block_col_start,
+                         kc + 1, shift_words, M_B);
+        load_chunk_B_ext(B_m_stage(next_stage), mask_B, block_col_start, kc + 1,
+                         shift_words, M_B);
+        __pipeline_commit();
+      }
+
+#pragma unroll
+      for (int tm = 0; tm < TILES_M_PER_WARP; ++tm) {
+        int row_off = (tile_m_base + tm) * WMMA_M * K_CHUNK_WORDS;
+        uint32_t *A_pm_tile = A_pm_buf + row_off;
+        uint32_t *A_m_tile = A_m_buf + row_off;
+
+        uint32_t a_pm0, a_pm1, a_pm2, a_pm3;
+        uint32_t a_m0, a_m1, a_m2, a_m3;
+        load_a_frag(A_pm_tile, a_pm0, a_pm1, a_pm2, a_pm3);
+        load_a_frag(A_m_tile, a_m0, a_m1, a_m2, a_m3);
+
+        uint32_t a_xp0 = a_m0 ^ a_pm0;
+        uint32_t a_xp1 = a_m1 ^ a_pm1;
+        uint32_t a_xp2 = a_m2 ^ a_pm2;
+        uint32_t a_xp3 = a_m3 ^ a_pm3;
+
+#pragma unroll
+        for (int tn = 0; tn < TILES_N_PER_WARP; ++tn) {
+          int col_off = (tile_n_base + tn) * WMMA_N * K_CHUNK_WORDS_EXT;
+          uint32_t *B_pm_tile = B_pm_buf + col_off;
+          uint32_t *B_m_tile = B_m_buf + col_off;
+
+          uint32_t b_pm0, b_pm1;
+          uint32_t b_m0, b_m1;
+          load_b_frag(B_pm_tile, b_pm0, b_pm1);
+          load_b_frag(B_m_tile, b_m0, b_m1);
+
+          uint32_t b_xp0 = b_m0 ^ b_pm0;
+          uint32_t b_xp1 = b_m1 ^ b_pm1;
+
+          mma_b1_and_popc_16x8x256(c1_frag[tm][tn][0], c1_frag[tm][tn][1],
+                                   c1_frag[tm][tn][2], c1_frag[tm][tn][3],
+                                   a_xp0, a_xp1, a_xp2, a_xp3, b_pm0, b_pm1);
+
+          mma_b1_and_popc_16x8x256(c2_frag[tm][tn][0], c2_frag[tm][tn][1],
+                                   c2_frag[tm][tn][2], c2_frag[tm][tn][3],
+                                   a_pm0, a_pm1, a_pm2, a_pm3, b_xp0, b_xp1);
+
+          mma_b1_and_popc_16x8x256(c3_frag[tm][tn][0], c3_frag[tm][tn][1],
+                                   c3_frag[tm][tn][2], c3_frag[tm][tn][3], a_m0,
+                                   a_m1, a_m2, a_m3, b_m0, b_m1);
+        }
+      }
+
+      if (kc + 1 < K_CHUNKS)
+        __pipeline_wait_prior(0);
+      __syncthreads();
+      stage ^= 1;
+    }
+
+    // Update minimum FHD for this shift
+#pragma unroll
+    for (int tm = 0; tm < TILES_M_PER_WARP; ++tm)
+#pragma unroll
+      for (int tn = 0; tn < TILES_N_PER_WARP; ++tn)
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          int32_t c3 = c3_frag[tm][tn][r];
+          if (c3 > 0) {
+            float fhd =
+                (float)(c1_frag[tm][tn][r] + c2_frag[tm][tn][r]) / (float)c3;
+            if (fhd < min_fhd[tm][tn][r])
+              min_fhd[tm][tn][r] = fhd;
+          }
+        }
+  }
+
+  // Store results - no triangle constraint for A vs B
+#pragma unroll
+  for (int tm = 0; tm < TILES_M_PER_WARP; ++tm) {
+    int row_block = block_row_start + (tile_m_base + tm) * WMMA_M;
+    int row0 = row_block + group;
+    int row1 = row_block + group + 8;
+
+#pragma unroll
+    for (int tn = 0; tn < TILES_N_PER_WARP; ++tn) {
+      int col_block = block_col_start + (tile_n_base + tn) * WMMA_N;
+      int col0 = col_block + tid * 2;
+      int col1 = col_block + tid * 2 + 1;
+
+      auto store = [&](int gi, int gj, float val) {
+        if (gi >= M_A || gj >= M_B)
+          return;
+        if (write_output && D) {
+          D[gi * M_B + gj] = (val <= 1.0f) ? val : 0.0f;
+        }
+        if (collect_pairs && val < threshold && pairs && match_count) {
+          unsigned int idx = atomicAdd(match_count, 1);
+          if (idx < max_pairs) {
+            pairs[idx] = make_uint2(gi, gj);
+          }
+        }
+      };
+
+      store(row0, col0, min_fhd[tm][tn][0]);
+      store(row0, col1, min_fhd[tm][tn][1]);
+      store(row1, col0, min_fhd[tm][tn][2]);
+      store(row1, col1, min_fhd[tm][tn][3]);
+    }
+  }
+}
+
+// C++/Python-facing launcher for A vs B comparison.
+extern "C" void launch_masked_hamming_ab_cuda(
+    const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
+    const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
+    int M_A, int M_B, float *dD, bool write_output, bool collect_pairs,
+    float threshold, uint2 *dPairs, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream) {
+  // Preprocess both A and B sets
+  int total_A = M_A * K_WORDS;
+  int total_B = M_B * K_WORDS;
+  preprocess_kernel<<<(total_A + 255) / 256, 256, 0, stream>>>(
+      dData_A, dMask_A, dPremasked_A, M_A);
+  preprocess_kernel<<<(total_B + 255) / 256, 256, 0, stream>>>(
+      dData_B, dMask_B, dPremasked_B, M_B);
+
+  dim3 grid((M_B + BLOCK_N - 1) / BLOCK_N, (M_A + BLOCK_M - 1) / BLOCK_M);
+  dim3 block(WARPS_PER_BLOCK * 32);
+
+  size_t smem =
+      2 * (2 * BLOCK_M * K_CHUNK_WORDS + 2 * BLOCK_N * K_CHUNK_WORDS_EXT) *
+      sizeof(uint32_t);
+
+  min_hamming_ab_kernel<<<grid, block, smem, stream>>>(
+      dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, dD, write_output,
+      collect_pairs, threshold, dPairs, dMatchCount, max_pairs);
+}

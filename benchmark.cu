@@ -15,12 +15,19 @@
 
 #include "iris_params.h"
 
-// External launcher from iris.cu
+// External launchers from iris.cu
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
     float *dD, bool write_output, bool collect_pairs, float threshold,
     uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream);
+
+extern "C" void launch_masked_hamming_ab_cuda(
+    const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
+    const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
+    int M_A, int M_B, float *dD, bool write_output, bool collect_pairs,
+    float threshold, uint2 *dPairs, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
 
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
@@ -211,7 +218,114 @@ int main(int argc, char **argv) {
                         cudaMemcpyDeviceToHost));
   printf("Matches found (last iter, threshold=0.3): %u\n", h_match_count);
 
-  // Cleanup
+  // ----------------- A vs B Benchmark -----------------
+  printf("\n=== A vs B Benchmark ===\n");
+
+  // Use M/2 for each set to keep total memory similar
+  int M_A = M / 2;
+  int M_B = M / 2;
+  printf("M_A: %d, M_B: %d\n", M_A, M_B);
+
+  // Allocate separate A and B buffers (reuse h_data/h_mask for A, generate new
+  // for B)
+  size_t data_size_A = (size_t)M_A * K_WORDS * sizeof(uint32_t);
+  size_t data_size_B = (size_t)M_B * K_WORDS * sizeof(uint32_t);
+
+  uint32_t *h_data_B = (uint32_t *)malloc(data_size_B);
+  uint32_t *h_mask_B = (uint32_t *)malloc(data_size_B);
+  fill_random(h_data_B, M_B * K_WORDS);
+  fill_random(h_mask_B, M_B * K_WORDS);
+
+  uint32_t *d_data_A, *d_mask_A, *d_premasked_A;
+  uint32_t *d_data_B, *d_mask_B, *d_premasked_B;
+
+  CHECK_CUDA(cudaMalloc(&d_data_A, data_size_A));
+  CHECK_CUDA(cudaMalloc(&d_mask_A, data_size_A));
+  CHECK_CUDA(cudaMalloc(&d_premasked_A, data_size_A));
+  CHECK_CUDA(cudaMalloc(&d_data_B, data_size_B));
+  CHECK_CUDA(cudaMalloc(&d_mask_B, data_size_B));
+  CHECK_CUDA(cudaMalloc(&d_premasked_B, data_size_B));
+
+  CHECK_CUDA(cudaMemcpy(d_data_A, h_data, data_size_A, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_mask_A, h_mask, data_size_A, cudaMemcpyHostToDevice));
+  CHECK_CUDA(
+      cudaMemcpy(d_data_B, h_data_B, data_size_B, cudaMemcpyHostToDevice));
+  CHECK_CUDA(
+      cudaMemcpy(d_mask_B, h_mask_B, data_size_B, cudaMemcpyHostToDevice));
+
+  // Warmup A vs B
+  printf("Warmup (%d iterations)... ", warmup_iters);
+  fflush(stdout);
+  for (int i = 0; i < warmup_iters; i++) {
+    CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
+    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A, d_data_B,
+                                  d_mask_B, d_premasked_B, M_A, M_B, nullptr,
+                                  false, true, 0.3f, d_pairs, d_match_count,
+                                  max_pairs, stream);
+  }
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  printf("done\n");
+
+  // Benchmark A vs B
+  double total_time_ab = 0.0;
+  double min_time_ab = 1e9, max_time_ab = 0.0;
+
+  for (int i = 0; i < bench_iters; i++) {
+    CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
+
+    CHECK_CUDA(cudaEventRecord(start, stream));
+    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A, d_data_B,
+                                  d_mask_B, d_premasked_B, M_A, M_B, nullptr,
+                                  false, true, 0.3f, d_pairs, d_match_count,
+                                  max_pairs, stream);
+    CHECK_CUDA(cudaEventRecord(stop, stream));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    times[i] = ms;
+    total_time_ab += ms;
+
+    if (ms < min_time_ab)
+      min_time_ab = ms;
+    if (ms > max_time_ab)
+      max_time_ab = ms;
+
+    printf("Iter %2d: %.3f ms\n", i + 1, ms);
+  }
+
+  double mean_ab = total_time_ab / bench_iters;
+  double variance_ab = 0.0;
+  for (int i = 0; i < bench_iters; i++) {
+    variance_ab += (times[i] - mean_ab) * (times[i] - mean_ab);
+  }
+  variance_ab /= bench_iters;
+  double stddev_ab = sqrt(variance_ab);
+
+  // A vs B comparisons: M_A * M_B (full rectangle)
+  double comparisons_ab = (double)M_A * M_B;
+  double pairs_per_s_m_ab = comparisons_ab / (mean_ab * 1e-3) / 1e6;
+
+  printf("\n=== A vs B Results ===\n");
+  printf("Time (mean ± std): %.3f ± %.3f ms\n", mean_ab, stddev_ab);
+  printf("Time (min / max): %.3f / %.3f ms\n", min_time_ab, max_time_ab);
+  printf("Pairs/s: %.3f M (31 shifts)\n", pairs_per_s_m_ab);
+
+  CHECK_CUDA(cudaMemcpy(&h_match_count, d_match_count, sizeof(unsigned int),
+                        cudaMemcpyDeviceToHost));
+  printf("Matches found (last iter, threshold=0.3): %u\n", h_match_count);
+
+  // Cleanup A vs B
+  free(h_data_B);
+  free(h_mask_B);
+  CHECK_CUDA(cudaFree(d_data_A));
+  CHECK_CUDA(cudaFree(d_mask_A));
+  CHECK_CUDA(cudaFree(d_premasked_A));
+  CHECK_CUDA(cudaFree(d_data_B));
+  CHECK_CUDA(cudaFree(d_mask_B));
+  CHECK_CUDA(cudaFree(d_premasked_B));
+
+  // Cleanup original
   free(times);
   free(h_data);
   free(h_mask);
