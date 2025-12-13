@@ -32,10 +32,10 @@ def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
 
     Args:
         bits: CUDA uint8 tensor of shape (M, 16, 200, 2, 2) with values in {0, 1}.
-              This tensor is modified IN-PLACE and should not be used after this call.
+              Modified in-place; do not use after this call.
 
     Returns:
-        Packed int32 tensor of shape (M, 400). Shares storage with the input tensor
+        Packed int32 tensor of shape (M, 400). Shares storage with input
         (no additional memory allocation).
     """
     return _C.pack_theta_major_cuda(bits)

@@ -66,10 +66,9 @@ torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
   // Input: (M, 16, 200, 2, 2) uint8 tensor with values in {0, 1}
   // Output: (M, 400) int32 tensor (packed bits, theta-major order)
   //
-  // IN-PLACE packing: the kernel packs data into the input buffer.
-  // The returned tensor shares storage with the input (first M*1600 bytes).
-  // The input tensor should not be used after this call.
-  // No additional memory is allocated beyond the input buffer.
+  // IN-PLACE packing with grid-level sync: the kernel packs data into the
+  // input buffer. Uses cooperative groups to ensure all reads complete before
+  // any writes. The returned tensor shares storage with the input.
   TORCH_CHECK(bits.is_cuda(), "bits must be CUDA tensor");
   TORCH_CHECK(bits.scalar_type() == at::kByte, "bits dtype must be uint8");
   TORCH_CHECK(bits.is_contiguous(), "bits must be contiguous");
@@ -80,17 +79,14 @@ torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
 
   int64_t M = bits.size(0);
 
-  // Pack in-place: the kernel reads from the full buffer (using shared memory)
-  // and writes compacted output to the beginning (row m at offset m*1600 bytes)
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_pack_theta_major_cuda(bits.data_ptr<uint8_t>(), (int)M, stream);
 
-  // Flatten to 1D, slice first M*1600 bytes, view as int32, reshape to (M, 400)
-  // This shares storage with the input tensor (no allocation).
-  auto flat = bits.flatten();                      // (M * 12800,) uint8
-  auto sliced = flat.slice(0, 0, M * K_WORDS * 4); // (M * 1600,) uint8
-  auto packed = sliced.view(torch::kInt32);        // (M * 400,) int32
-  return packed.view({M, K_WORDS});                // (M, 400) int32
+  // Return view of packed data (first M * 400 int32 words)
+  auto flat = bits.flatten();
+  auto sliced = flat.slice(0, 0, M * K_WORDS * 4);
+  auto packed = sliced.view(torch::kInt32);
+  return packed.view({M, K_WORDS});
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

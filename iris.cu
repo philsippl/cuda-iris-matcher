@@ -331,66 +331,80 @@ __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
 }
 
 // ----------------- Pack theta-major kernel -----------------
-// Packs (M, 16, 200, 2, 2) uint8 bits into (M, 400) int32 words in-place.
-// Uses shared memory to buffer each row before writing compacted output.
-// Input layout strides: r=800, theta=4, d0=2, d1=1
+// Packs (M, 16, 200, 2, 2) uint8 bits into (M, 400) int32 words IN-PLACE.
+// Uses cooperative groups for grid-level sync to ensure all reads complete
+// before any writes. Input layout strides: r=800, theta=4, d0=2, d1=1
 // Output is theta-major: theta is fastest-varying in the packed bitstream.
 
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
 __global__ void pack_theta_major_kernel(uint8_t *data, int M) {
+  cg::grid_group grid = cg::this_grid();
+
   int m = blockIdx.x;
   if (m >= M)
     return;
 
-  // Use dynamically allocated shared memory (passed via launch config)
+  // Use shared memory to buffer this row's input before grid sync
   extern __shared__ uint32_t smem_raw[];
   uint8_t *bits_smem = reinterpret_cast<uint8_t *>(smem_raw);
 
   // Load row m from global memory into shared memory
-  // Input row is at offset m * 12800 bytes
   const uint8_t *in_row = data + m * K_BITS;
   for (int i = threadIdx.x; i < K_BITS; i += blockDim.x) {
     bits_smem[i] = in_row[i];
   }
   __syncthreads();
 
-  // Output location (compacted): row m starts at m * 400 words
-  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * K_WORDS;
+  // Pack into registers (not yet written to global memory)
+  uint32_t packed_words[K_WORDS / 256 + 1]; // Each thread handles ~2 words
+  int num_words = 0;
+  int word_indices[K_WORDS / 256 + 1];
 
-  // Pack 400 words, each thread handles multiple words
   for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
     uint32_t word = 0;
 
 #pragma unroll
     for (int b = 0; b < 32; b++) {
       int linear_bit = w * 32 + b;
-      // Theta-major layout: theta varies fastest in groups of 64 bits
-      int theta = linear_bit / 64; // 0..199
-      int inner = linear_bit % 64; // position within (16, 2, 2) block
-      int r = inner / 4;           // 0..15
-      int d0 = (inner / 2) % 2;    // 0..1
-      int d1 = inner % 2;          // 0..1
-
-      // Source index in original (16, 200, 2, 2) layout
-      // Strides: r=800, theta=4, d0=2, d1=1
+      int theta = linear_bit / 64;
+      int inner = linear_bit % 64;
+      int r = inner / 4;
+      int d0 = (inner / 2) % 2;
+      int d1 = inner % 2;
       int src_idx = r * 800 + theta * 4 + d0 * 2 + d1;
 
       if (bits_smem[src_idx]) {
         word |= (1u << b);
       }
     }
-    out_row[w] = word;
+    packed_words[num_words] = word;
+    word_indices[num_words] = w;
+    num_words++;
+  }
+
+  // Grid-level sync: all blocks wait here until everyone has read their data
+  grid.sync();
+
+  // Now safe to write - all reads are complete
+  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * K_WORDS;
+  for (int i = 0; i < num_words; i++) {
+    out_row[word_indices[i]] = packed_words[i];
   }
 }
 
 // C++/Python-facing launcher for packing kernel.
-// Takes buffer of size M * 12800 bytes (uint8), packs in-place to M * 400
-// int32. After this call, only the first M * 1600 bytes contain valid data.
+// Packs M * 12800 bytes (uint8) into M * 400 int32 words IN-PLACE.
+// Uses cooperative kernel launch for grid-level synchronization.
 extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
                                              cudaStream_t stream) {
-  // One block per row, 256 threads, 12800 bytes shared memory (aligned to 4)
   int threads = 256;
-  size_t smem = ((K_BITS + 3) / 4) * 4; // 12800 bytes, aligned
-  pack_theta_major_kernel<<<M, threads, smem, stream>>>(data, M);
+  size_t smem = ((K_BITS + 3) / 4) * 4; // 12800 bytes aligned
+
+  void *args[] = {&data, &M};
+  cudaLaunchCooperativeKernel((void *)pack_theta_major_kernel, dim3(M),
+                              dim3(threads), args, smem, stream);
 }
 
 // C++/Python-facing launcher (keeps launch config and smem sizing in one
