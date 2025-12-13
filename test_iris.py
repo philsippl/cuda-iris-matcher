@@ -95,11 +95,23 @@ def main():
     code = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
     mask = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
 
-    data_words = ih.pack_theta_major(code)
-    mask_words = ih.pack_theta_major(mask)
+    # --- Timing: Loading onto GPU ---
+    t0_load = time.perf_counter()
+    code_t = torch.from_numpy(code).to(device=device)
+    mask_t_raw = torch.from_numpy(mask).to(device=device)
+    torch.cuda.synchronize()
+    t1_load = time.perf_counter()
+    load_ms = (t1_load - t0_load) * 1e3
+    print(f"Loading onto GPU: {load_ms:.3f} ms for M={M}")
 
-    data_t = torch.from_numpy(data_words).to(device=device)
-    mask_t = torch.from_numpy(mask_words).to(device=device)
+    # --- Timing: Packing (CUDA kernel, in-place) ---
+    t0_pack = time.perf_counter()
+    data_t = ih.pack_theta_major(code_t)
+    mask_t = ih.pack_theta_major(mask_t_raw)
+    torch.cuda.synchronize()
+    t1_pack = time.perf_counter()
+    pack_ms = (t1_pack - t0_pack) * 1e3
+    print(f"Packing (CUDA): {pack_ms:.3f} ms for M={M}")
 
     # Single run (GPU) with output + pair collection
     start_event = torch.cuda.Event(enable_timing=True)
@@ -120,14 +132,30 @@ def main():
     elapsed_ms = start_event.elapsed_time(end_event)
     pairs_total = 0.5 * M * (M - 1)
     pairs_per_s = pairs_total / (elapsed_ms * 1e-3) / 1e6
-    print(f"M={M}, time={elapsed_ms:.3f} ms, pairs/s={pairs_per_s:.3f} M (31 shifts)")
+    print(f"Kernel compute: {elapsed_ms:.3f} ms, pairs/s={pairs_per_s:.3f} M (31 shifts)")
+
+    # --- Timing: Copying back results ---
+    t0_copy = time.perf_counter()
+    D_cpu = D.cpu()
+    count = match_count.cpu().item() if match_count.numel() else 0
+    pairs_cpu = pairs.cpu() if count > 0 else None
+    t1_copy = time.perf_counter()
+    copy_ms = (t1_copy - t0_copy) * 1e3
+    print(f"Copying back results: {copy_ms:.3f} ms")
+
+    # Summary
+    total_ms = pack_ms + load_ms + elapsed_ms + copy_ms
+    print(f"\nTotal pipeline time: {total_ms:.3f} ms")
+    print(f"  - Packing:     {pack_ms:7.3f} ms ({100*pack_ms/total_ms:5.1f}%)")
+    print(f"  - GPU load:    {load_ms:7.3f} ms ({100*load_ms/total_ms:5.1f}%)")
+    print(f"  - Kernel:      {elapsed_ms:7.3f} ms ({100*elapsed_ms/total_ms:5.1f}%)")
+    print(f"  - Copy back:   {copy_ms:7.3f} ms ({100*copy_ms/total_ms:5.1f}%)")
 
     # Fetch count and a few pairs
-    count = match_count.cpu().item() if match_count.numel() else 0
-    print(f"Matches found: {count}")
+    print(f"\nMatches found: {count}")
     if count > 0:
         capped = min(count, pairs.size(0))
-        print("Sample pairs:", pairs[: min(8, capped)].cpu())
+        print("Sample pairs:", pairs_cpu[: min(8, capped)])
 
     # ----------------- NumPy reference verification -----------------
     # Compute min FHD over theta-roll shifts for the lower triangle.
@@ -150,21 +178,21 @@ def main():
                     best = fhd
             ref[i, j] = best if best <= 1.0 else 0.0
 
-    D_cpu = D.cpu().numpy()
-    max_err = np.max(np.abs(D_cpu - ref))
+    D_cpu_np = D_cpu.numpy()
+    max_err = np.max(np.abs(D_cpu_np - ref))
     print(f"NumPy check: max_abs_err={max_err:.3e}")
     if max_err > 1e-5:
         # Print a few mismatches
-        mism = np.argwhere(np.abs(D_cpu - ref) > 1e-5)
+        mism = np.argwhere(np.abs(D_cpu_np - ref) > 1e-5)
         print("Mismatches (up to 8):")
         for k in range(min(8, mism.shape[0])):
             ii, jj = mism[k]
-            print(f"  ({ii},{jj}): gpu={D_cpu[ii,jj]:.6f} numpy={ref[ii,jj]:.6f}")
+            print(f"  ({ii},{jj}): gpu={D_cpu_np[ii,jj]:.6f} numpy={ref[ii,jj]:.6f}")
 
     # ----------------- Performance-only check (no NumPy validation) -----------------
     # Run performance test on all visible CUDA devices concurrently and aggregate throughput.
     M_perf = int(os.environ.get("M_PERF", "4096"))
-    warmup = int(os.environ.get("PERF_WARMUP", "1"))
+    warmup = int(os.environ.get("PERF_WARMUP", "0"))
     repeats = int(os.environ.get("PERF_REPEATS", "1"))
 
     if not torch.cuda.is_available():
@@ -172,9 +200,37 @@ def main():
         return
 
     ndev = torch.cuda.device_count()
+
+    # Measure packing overhead at scale
+    print(f"\n--- Performance run: M_PERF={M_perf} ---")
+    code_perf = np.random.randint(0, 2, (M_perf, 16, 200, 2, 2), dtype=np.uint8)
+    mask_perf = np.random.randint(0, 2, (M_perf, 16, 200, 2, 2), dtype=np.uint8)
+
+    # Load onto GPU
+    t0_load_perf = time.perf_counter()
+    code_cuda = torch.from_numpy(code_perf).cuda()
+    mask_cuda = torch.from_numpy(mask_perf).cuda()
+    torch.cuda.synchronize()
+    t1_load_perf = time.perf_counter()
+    load_perf_ms = (t1_load_perf - t0_load_perf) * 1e3
+    print(f"Loading onto GPU: {load_perf_ms:.3f} ms for M={M_perf}")
+
+    # CUDA packing (in-place)
+    t0_pack_perf = time.perf_counter()
+    data_words_cuda = ih.pack_theta_major(code_cuda)
+    mask_words_cuda = ih.pack_theta_major(mask_cuda)
+    torch.cuda.synchronize()
+    t1_pack_perf = time.perf_counter()
+    pack_perf_ms = (t1_pack_perf - t0_pack_perf) * 1e3
+    print(f"Packing (CUDA): {pack_perf_ms:.3f} ms for M={M_perf}")
+
+    # Clean up to free GPU memory before spawning workers
+    del code_perf, mask_perf, code_cuda, mask_cuda, data_words_cuda, mask_words_cuda
+    torch.cuda.empty_cache()
+
     print(
-        f"\nPerf run (no validation, concurrent): devices={ndev}, "
-        f"M_PERF={M_perf}, warmup={warmup}, repeats={repeats}"
+        f"\nKernel benchmark (concurrent): devices={ndev}, "
+        f"warmup={warmup}, repeats={repeats}"
     )
 
     ctx = mp.get_context("spawn")
@@ -224,12 +280,21 @@ def main():
         agg_pairs_per_s_m_sum = sum(r["pairs_per_s_m"] for r in ok)
         max_elapsed_s = max(r["elapsed_ms"] for r in ok) * 1e-3
         agg_pairs_per_s_m_concurrent = total_pairs / max(1e-9, max_elapsed_s) / 1e6
+        max_kernel_ms = max(r["elapsed_ms"] for r in ok)
         print(
-            f"\nAggregate: devices_ok={len(ok)}/{ndev}, wall={wall_s*1e3:.1f} ms, "
+            f"\nAggregate kernel: devices_ok={len(ok)}/{ndev}, wall={wall_s*1e3:.1f} ms, "
             f"pairs/s={agg_pairs_per_s_m_sum:.3f} M (sum of per-device), "
             f"{agg_pairs_per_s_m_concurrent:.3f} M (total/max_device_time), "
             f"{agg_pairs_per_s_m_wall:.3f} M (wall)"
         )
+
+        # Full pipeline summary (packing + load + kernel)
+        total_pipeline_ms = pack_perf_ms + load_perf_ms + max_kernel_ms
+        print(f"\nFull pipeline breakdown for M={M_perf}:")
+        print(f"  - Packing:     {pack_perf_ms:9.3f} ms ({100*pack_perf_ms/total_pipeline_ms:5.1f}%)")
+        print(f"  - GPU load:    {load_perf_ms:9.3f} ms ({100*load_perf_ms/total_pipeline_ms:5.1f}%)")
+        print(f"  - Kernel:      {max_kernel_ms:9.3f} ms ({100*max_kernel_ms/total_pipeline_ms:5.1f}%)")
+        print(f"  - Total:       {total_pipeline_ms:9.3f} ms")
 
 
 if __name__ == "__main__":

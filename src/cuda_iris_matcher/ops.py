@@ -26,3 +26,18 @@ def masked_hamming_cuda(
     return _C.masked_hamming_cuda(data, mask, write_output, collect_pairs, threshold, max_pairs)
 
 
+def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
+    """
+    Pack iris code bits into theta-major int32 words using CUDA.
+
+    Args:
+        bits: CUDA uint8 tensor of shape (M, 16, 200, 2, 2) with values in {0, 1}.
+              This tensor is modified IN-PLACE and should not be used after this call.
+
+    Returns:
+        Packed int32 tensor of shape (M, 400). Shares storage with the input tensor
+        (no additional memory allocation).
+    """
+    return _C.pack_theta_major_cuda(bits)
+
+

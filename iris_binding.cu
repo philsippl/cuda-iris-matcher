@@ -11,6 +11,9 @@ extern "C" void launch_masked_hamming_cuda(
     uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream);
 
+extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
+                                             cudaStream_t stream);
+
 std::vector<torch::Tensor>
 masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
                     bool collect_pairs, double threshold, int64_t max_pairs) {
@@ -59,7 +62,40 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
   return {D, pairs, match_count};
 }
 
+torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
+  // Input: (M, 16, 200, 2, 2) uint8 tensor with values in {0, 1}
+  // Output: (M, 400) int32 tensor (packed bits, theta-major order)
+  //
+  // IN-PLACE packing: the kernel packs data into the input buffer.
+  // The returned tensor shares storage with the input (first M*1600 bytes).
+  // The input tensor should not be used after this call.
+  // No additional memory is allocated beyond the input buffer.
+  TORCH_CHECK(bits.is_cuda(), "bits must be CUDA tensor");
+  TORCH_CHECK(bits.scalar_type() == at::kByte, "bits dtype must be uint8");
+  TORCH_CHECK(bits.is_contiguous(), "bits must be contiguous");
+  TORCH_CHECK(bits.dim() == 5, "bits must have shape (M, 16, 200, 2, 2)");
+  TORCH_CHECK(bits.size(1) == 16 && bits.size(2) == 200 && bits.size(3) == 2 &&
+                  bits.size(4) == 2,
+              "bits must have shape (M, 16, 200, 2, 2)");
+
+  int64_t M = bits.size(0);
+
+  // Pack in-place: the kernel reads from the full buffer (using shared memory)
+  // and writes compacted output to the beginning (row m at offset m*1600 bytes)
+  auto stream = at::cuda::getDefaultCUDAStream();
+  launch_pack_theta_major_cuda(bits.data_ptr<uint8_t>(), (int)M, stream);
+
+  // Flatten to 1D, slice first M*1600 bytes, view as int32, reshape to (M, 400)
+  // This shares storage with the input tensor (no allocation).
+  auto flat = bits.flatten();                      // (M * 12800,) uint8
+  auto sliced = flat.slice(0, 0, M * K_WORDS * 4); // (M * 1600,) uint8
+  auto packed = sliced.view(torch::kInt32);        // (M * 400,) int32
+  return packed.view({M, K_WORDS});                // (M, 400) int32
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("masked_hamming_cuda", &masked_hamming_cuda,
         "Masked hamming distance (CUDA)");
+  m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
+        "Pack iris bits to theta-major int32 words (CUDA)");
 }

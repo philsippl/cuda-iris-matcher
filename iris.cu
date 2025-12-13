@@ -330,6 +330,69 @@ __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
   }
 }
 
+// ----------------- Pack theta-major kernel -----------------
+// Packs (M, 16, 200, 2, 2) uint8 bits into (M, 400) int32 words in-place.
+// Uses shared memory to buffer each row before writing compacted output.
+// Input layout strides: r=800, theta=4, d0=2, d1=1
+// Output is theta-major: theta is fastest-varying in the packed bitstream.
+
+__global__ void pack_theta_major_kernel(uint8_t *data, int M) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+
+  // Use dynamically allocated shared memory (passed via launch config)
+  extern __shared__ uint32_t smem_raw[];
+  uint8_t *bits_smem = reinterpret_cast<uint8_t *>(smem_raw);
+
+  // Load row m from global memory into shared memory
+  // Input row is at offset m * 12800 bytes
+  const uint8_t *in_row = data + m * K_BITS;
+  for (int i = threadIdx.x; i < K_BITS; i += blockDim.x) {
+    bits_smem[i] = in_row[i];
+  }
+  __syncthreads();
+
+  // Output location (compacted): row m starts at m * 400 words
+  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * K_WORDS;
+
+  // Pack 400 words, each thread handles multiple words
+  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+    uint32_t word = 0;
+
+#pragma unroll
+    for (int b = 0; b < 32; b++) {
+      int linear_bit = w * 32 + b;
+      // Theta-major layout: theta varies fastest in groups of 64 bits
+      int theta = linear_bit / 64; // 0..199
+      int inner = linear_bit % 64; // position within (16, 2, 2) block
+      int r = inner / 4;           // 0..15
+      int d0 = (inner / 2) % 2;    // 0..1
+      int d1 = inner % 2;          // 0..1
+
+      // Source index in original (16, 200, 2, 2) layout
+      // Strides: r=800, theta=4, d0=2, d1=1
+      int src_idx = r * 800 + theta * 4 + d0 * 2 + d1;
+
+      if (bits_smem[src_idx]) {
+        word |= (1u << b);
+      }
+    }
+    out_row[w] = word;
+  }
+}
+
+// C++/Python-facing launcher for packing kernel.
+// Takes buffer of size M * 12800 bytes (uint8), packs in-place to M * 400
+// int32. After this call, only the first M * 1600 bytes contain valid data.
+extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
+                                             cudaStream_t stream) {
+  // One block per row, 256 threads, 12800 bytes shared memory (aligned to 4)
+  int threads = 256;
+  size_t smem = ((K_BITS + 3) / 4) * 4; // 12800 bytes, aligned
+  pack_theta_major_kernel<<<M, threads, smem, stream>>>(data, M);
+}
+
 // C++/Python-facing launcher (keeps launch config and smem sizing in one
 // place).
 extern "C" void launch_masked_hamming_cuda(
