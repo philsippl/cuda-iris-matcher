@@ -407,6 +407,68 @@ extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
                               dim3(threads), args, smem, stream);
 }
 
+// ----------------- Repack u32 from r-major to theta-major -----------------
+// Input: (M, 400) int32 packed in r-major order: bit[r,theta,d0,d1] at
+//        linear_bit = r*800 + theta*4 + d0*2 + d1
+// Output: (M, 400) int32 packed in theta-major order: bit[r,theta,d0,d1] at
+//        linear_bit = theta*64 + r*4 + d0*2 + d1
+
+__global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
+                                             uint32_t *__restrict__ output,
+                                             int M) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+
+  extern __shared__ uint32_t smem[];
+
+  // Load entire row into shared memory
+  const uint32_t *in_row = input + m * K_WORDS;
+  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+    smem[w] = in_row[w];
+  }
+  __syncthreads();
+
+  // Repack to theta-major
+  uint32_t *out_row = output + m * K_WORDS;
+  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+    uint32_t word = 0;
+
+#pragma unroll
+    for (int b = 0; b < 32; b++) {
+      // Output bit position (theta-major)
+      int dst_linear_bit = w * 32 + b;
+      int theta = dst_linear_bit / 64;
+      int inner = dst_linear_bit % 64;
+      int r = inner / 4;
+      int d0 = (inner / 2) % 2;
+      int d1 = inner % 2;
+
+      // Source bit position (r-major)
+      int src_linear_bit = r * 800 + theta * 4 + d0 * 2 + d1;
+      int src_word = src_linear_bit / 32;
+      int src_bit = src_linear_bit % 32;
+
+      if ((smem[src_word] >> src_bit) & 1) {
+        word |= (1u << b);
+      }
+    }
+
+    out_row[w] = word;
+  }
+}
+
+// C++/Python-facing launcher for repacking kernel.
+// Repacks M * 400 int32 words from r-major to theta-major order.
+extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
+                                                  uint32_t *output, int M,
+                                                  cudaStream_t stream) {
+  int threads = 256;
+  size_t smem = K_WORDS * sizeof(uint32_t); // 400 words = 1600 bytes
+
+  repack_to_theta_major_kernel<<<M, threads, smem, stream>>>(input, output, M);
+}
+
 // C++/Python-facing launcher (keeps launch config and smem sizing in one
 // place).
 extern "C" void launch_masked_hamming_cuda(

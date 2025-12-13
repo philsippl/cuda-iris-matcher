@@ -41,3 +41,17 @@ def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
     return _C.pack_theta_major_cuda(bits)
 
 
+def repack_to_theta_major_cuda(input: torch.Tensor) -> torch.Tensor:
+    """
+    Repack int32 words from r-major to theta-major order using CUDA.
+
+    Args:
+        input: CUDA int32 tensor of shape (M, 400) packed in r-major order.
+               Original layout: bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
+
+    Returns:
+        New CUDA int32 tensor of shape (M, 400) packed in theta-major order.
+        Output layout: bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+    """
+    return _C.repack_to_theta_major_cuda(input)
+

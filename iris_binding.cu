@@ -14,6 +14,10 @@ extern "C" void launch_masked_hamming_cuda(
 extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
                                              cudaStream_t stream);
 
+extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
+                                                  uint32_t *output, int M,
+                                                  cudaStream_t stream);
+
 std::vector<torch::Tensor>
 masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
                     bool collect_pairs, double threshold, int64_t max_pairs) {
@@ -114,9 +118,33 @@ torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
   return packed.view({M, K_WORDS});
 }
 
+torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
+  // Input: (M, 400) int32 tensor packed in r-major order
+  //        bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
+  // Output: (M, 400) int32 tensor packed in theta-major order
+  //        bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+  TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
+  TORCH_CHECK(input.scalar_type() == at::kInt, "input dtype must be int32");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(input.dim() == 2 && input.size(1) == K_WORDS,
+              "input must have shape (M, ", K_WORDS, ")");
+
+  int64_t M = input.size(0);
+  auto output = torch::empty_like(input);
+
+  auto stream = at::cuda::getDefaultCUDAStream();
+  launch_repack_to_theta_major_cuda(
+      reinterpret_cast<const uint32_t *>(input.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(output.data_ptr<int>()), (int)M, stream);
+
+  return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("masked_hamming_cuda", &masked_hamming_cuda,
         "Masked hamming distance (CUDA)");
   m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
         "Pack iris bits to theta-major int32 words (CUDA)");
+  m.def("repack_to_theta_major_cuda", &repack_to_theta_major_cuda,
+        "Repack int32 words from r-major to theta-major order (CUDA)");
 }
