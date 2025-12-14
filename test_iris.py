@@ -1,10 +1,15 @@
 import torch
 import os
+import sys
 import time
 import multiprocessing as mp
 import numpy as np
 
+# Add tests directory to path for utils import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "tests"))
+
 import cuda_iris_matcher as ih
+from tests.utils import rotation_aware_hamming_distance
 
 
 def _perf_worker(
@@ -37,14 +42,15 @@ def _perf_worker(
         ).contiguous()
 
         # Warmup (init kernels, caches, allocator).
+        # New interface: use minimal max_pairs for warmup
         for _ in range(max(0, warmup)):
             ih.masked_hamming_cuda(
                 data_perf,
                 mask_perf,
-                write_output=False,
-                collect_pairs=False,
-                threshold=1.0,
-                max_pairs=0,
+                match_threshold=1.0,
+                non_match_threshold=1.0,
+                include_flags=ih.INCLUDE_ALL,
+                max_pairs=1,  # Minimal allocation for warmup
             )
         torch.cuda.synchronize(device)
 
@@ -60,10 +66,10 @@ def _perf_worker(
             ih.masked_hamming_cuda(
                 data_perf,
                 mask_perf,
-                write_output=False,
-                collect_pairs=False,
-                threshold=1.0,
-                max_pairs=0,
+                match_threshold=1.0,
+                non_match_threshold=1.0,
+                include_flags=ih.INCLUDE_ALL,
+                max_pairs=1,  # Minimal allocation for perf test
             )
         end_event.record()
         torch.cuda.synchronize(device)
@@ -114,17 +120,19 @@ def main():
     print(f"Packing (CUDA): {pack_ms:.3f} ms for M={M}")
 
     # Single run (GPU) with output + pair collection
+    # New interface: returns (pair_indices, categories, distances, count)
+    max_pairs = M * (M - 1) // 2
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     start_event.record()
-    D, pairs, match_count = ih.masked_hamming_cuda(
+    pair_indices, categories, distances, match_count = ih.masked_hamming_cuda(
         data_t,
         mask_t,
-        write_output=True,
-        collect_pairs=True,
-        threshold=0.5,
-        max_pairs=1 << 16,
+        match_threshold=0.5,
+        non_match_threshold=0.5,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
     )
     end_event.record()
     torch.cuda.synchronize()
@@ -134,15 +142,12 @@ def main():
     pairs_per_s = pairs_total / (elapsed_ms * 1e-3) / 1e6
     print(f"Kernel compute: {elapsed_ms:.3f} ms, pairs/s={pairs_per_s:.3f} M (31 shifts)")
 
-    # --- Timing: Copying back results ---
-    # Note: pairs and match_count are already pinned CPU tensors (async copied)
+    # --- Timing: Accessing results (already on CPU pinned memory) ---
     t0_copy = time.perf_counter()
-    D_cpu = D.cpu()
-    count = match_count.item() if match_count.numel() else 0
-    pairs_cpu = pairs if count > 0 else None
+    count = match_count.item()
     t1_copy = time.perf_counter()
     copy_ms = (t1_copy - t0_copy) * 1e3
-    print(f"Copying back results: {copy_ms:.3f} ms (D only; pairs already on CPU)")
+    print(f"Reading count: {copy_ms:.3f} ms (results already on pinned CPU)")
 
     # Summary
     total_ms = pack_ms + load_ms + elapsed_ms + copy_ms
@@ -153,42 +158,42 @@ def main():
     print(f"  - Copy back:   {copy_ms:7.3f} ms ({100*copy_ms/total_ms:5.1f}%)")
 
     # Fetch count and a few pairs
-    print(f"\nMatches found: {count}")
+    print(f"\nPairs returned: {count}")
     if count > 0:
-        capped = min(count, pairs.size(0))
-        print("Sample pairs:", pairs_cpu[: min(8, capped)])
+        print("Sample pairs (idx, category, distance):")
+        for k in range(min(8, count)):
+            i, j = pair_indices[k].tolist()
+            cat = categories[k].item()
+            dist = distances[k].item()
+            print(f"  ({i}, {j}): cat={cat}, dist={dist:.4f}")
 
     # ----------------- NumPy reference verification -----------------
     # Compute min FHD over theta-roll shifts for the lower triangle.
-    ref = np.zeros((M, M), dtype=np.float32)
+    ref = {}
     for i in range(M):
         for j in range(i):
-            mi = mask[i].astype(bool)
-            di = code[i].astype(bool)
-            best = 2.0
-            for s in range(-15, 16):
-                djr = np.roll(code[j], s, axis=1).astype(bool)   # axis=1 of IrisCode => theta
-                mjr = np.roll(mask[j], s, axis=1).astype(bool)
-                inter = mi & mjr
-                valid = int(inter.sum())
-                if valid == 0:
-                    continue
-                ham = int(((di ^ djr) & inter).sum())
-                fhd = ham / valid
-                if fhd < best:
-                    best = fhd
-            ref[i, j] = best if best <= 1.0 else 0.0
+            dist, _ = rotation_aware_hamming_distance(code[i], mask[i], code[j], mask[j])
+            ref[(i, j)] = dist
 
-    D_cpu_np = D_cpu.numpy()
-    max_err = np.max(np.abs(D_cpu_np - ref))
-    print(f"NumPy check: max_abs_err={max_err:.3e}")
-    if max_err > 1e-5:
-        # Print a few mismatches
-        mism = np.argwhere(np.abs(D_cpu_np - ref) > 1e-5)
+    # Compare CUDA results with NumPy reference
+    max_err = 0.0
+    mismatches = []
+    for k in range(count):
+        i, j = pair_indices[k].tolist()
+        cuda_dist = distances[k].item()
+        # Get reference (may need to swap i,j for lower triangle)
+        ref_dist = ref.get((i, j), ref.get((j, i), -1))
+        err = abs(cuda_dist - ref_dist)
+        if err > max_err:
+            max_err = err
+        if err > 1e-5:
+            mismatches.append((i, j, cuda_dist, ref_dist))
+
+    print(f"\nNumPy check: max_abs_err={max_err:.3e}")
+    if mismatches:
         print("Mismatches (up to 8):")
-        for k in range(min(8, mism.shape[0])):
-            ii, jj = mism[k]
-            print(f"  ({ii},{jj}): gpu={D_cpu_np[ii,jj]:.6f} numpy={ref[ii,jj]:.6f}")
+        for i, j, cuda_d, ref_d in mismatches[:8]:
+            print(f"  ({i},{j}): gpu={cuda_d:.6f} numpy={ref_d:.6f}")
 
     # ----------------- Performance-only check (no NumPy validation) -----------------
     # Run performance test on all visible CUDA devices concurrently and aggregate throughput.

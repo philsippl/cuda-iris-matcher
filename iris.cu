@@ -78,9 +78,17 @@ __device__ inline void load_b_frag(const uint32_t *Bs_ext, uint32_t &b0,
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
     min_hamming_kernel(const uint32_t *__restrict__ premasked,
                        const uint32_t *__restrict__ mask, int M,
-                       float *__restrict__ D, bool write_output,
-                       bool collect_pairs, float threshold,
-                       uint2 *__restrict__ pairs, unsigned int *match_count,
+                       // Classification parameters
+                       const int32_t *__restrict__ labels,  // [M] or nullptr (no classification)
+                       float match_threshold,
+                       float non_match_threshold,
+                       bool is_similarity,
+                       uint8_t include_flags,
+                       // Output arrays (sparse format)
+                       int32_t *__restrict__ pair_indices,   // [max_pairs, 2]
+                       uint8_t *__restrict__ categories,     // [max_pairs]
+                       float *__restrict__ out_distances,    // [max_pairs]
+                       unsigned int *match_count,
                        unsigned int max_pairs) {
   int warp_id = threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -300,13 +308,55 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       auto store = [&](int gi, int gj, float val) {
         if (gi >= M || gj >= M || gi <= gj)
           return;
-        if (write_output && D) {
-          D[gi * M + gj] = (val <= 1.0f) ? val : 0.0f;
+        if (pair_indices == nullptr || match_count == nullptr)
+          return;
+
+        // Classification logic
+        uint8_t category;
+        bool emit = false;
+
+        if (labels != nullptr) {
+          // Label-aware classification
+          bool same_label = (labels[gi] == labels[gj]);
+
+          bool is_match, is_non_match;
+          if (is_similarity) {
+            // Similarity: higher = more similar
+            is_match = (val >= match_threshold);
+            is_non_match = (val < non_match_threshold);
+          } else {
+            // Distance: lower = more similar
+            is_match = (val <= match_threshold);
+            is_non_match = (val > non_match_threshold);
+          }
+
+          if (same_label && is_match) {
+            category = CATEGORY_TRUE_MATCH;
+            emit = (include_flags & INCLUDE_TM);
+          } else if (!same_label && is_match) {
+            category = CATEGORY_FALSE_MATCH;
+            emit = (include_flags & INCLUDE_FM);
+          } else if (same_label && is_non_match) {
+            category = CATEGORY_FALSE_NON_MATCH;
+            emit = (include_flags & INCLUDE_FNM);
+          } else if (!same_label && is_non_match) {
+            category = CATEGORY_TRUE_NON_MATCH;
+            emit = (include_flags & INCLUDE_TNM);
+          }
+          // Pairs in gap between thresholds are not emitted
+        } else {
+          // No labels: emit all pairs (no classification)
+          category = 0xFF;  // Unclassified
+          emit = true;
         }
-        if (collect_pairs && val < threshold && pairs && match_count) {
+
+        if (emit) {
           unsigned int idx = atomicAdd(match_count, 1);
           if (idx < max_pairs) {
-            pairs[idx] = make_uint2(gi, gj);
+            pair_indices[idx * 2] = gi;
+            pair_indices[idx * 2 + 1] = gj;
+            if (categories) categories[idx] = category;
+            if (out_distances) out_distances[idx] = val;
           }
         }
       };
@@ -473,8 +523,10 @@ extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
 // place).
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    float *dD, bool write_output, bool collect_pairs, float threshold,
-    uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
+    const int32_t *dLabels, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream) {
   int total = M * K_WORDS;
   preprocess_kernel<<<(total + 255) / 256, 256, 0, stream>>>(dData, dMask,
@@ -488,7 +540,8 @@ extern "C" void launch_masked_hamming_cuda(
       sizeof(uint32_t);
 
   min_hamming_kernel<<<grid, block, smem, stream>>>(
-      dPremasked, dMask, M, dD, write_output, collect_pairs, threshold, dPairs,
+      dPremasked, dMask, M, dLabels, match_threshold, non_match_threshold,
+      is_similarity, include_flags, dPairIndices, dCategories, dOutDistances,
       dMatchCount, max_pairs);
 }
 
@@ -503,9 +556,18 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
                           const uint32_t *__restrict__ mask_A,
                           const uint32_t *__restrict__ premasked_B,
                           const uint32_t *__restrict__ mask_B, int M_A, int M_B,
-                          float *__restrict__ D, bool write_output,
-                          bool collect_pairs, float threshold,
-                          uint2 *__restrict__ pairs, unsigned int *match_count,
+                          // Classification parameters
+                          const int32_t *__restrict__ labels_A,  // [M_A] or nullptr
+                          const int32_t *__restrict__ labels_B,  // [M_B] or nullptr
+                          float match_threshold,
+                          float non_match_threshold,
+                          bool is_similarity,
+                          uint8_t include_flags,
+                          // Output arrays (sparse format)
+                          int32_t *__restrict__ pair_indices,   // [max_pairs, 2]
+                          uint8_t *__restrict__ categories,     // [max_pairs]
+                          float *__restrict__ out_distances,    // [max_pairs]
+                          unsigned int *match_count,
                           unsigned int max_pairs) {
   int warp_id = threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -726,13 +788,55 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       auto store = [&](int gi, int gj, float val) {
         if (gi >= M_A || gj >= M_B)
           return;
-        if (write_output && D) {
-          D[gi * M_B + gj] = (val <= 1.0f) ? val : 0.0f;
+        if (pair_indices == nullptr || match_count == nullptr)
+          return;
+
+        // Classification logic
+        uint8_t category;
+        bool emit = false;
+
+        if (labels_A != nullptr && labels_B != nullptr) {
+          // Label-aware classification
+          bool same_label = (labels_A[gi] == labels_B[gj]);
+
+          bool is_match, is_non_match;
+          if (is_similarity) {
+            // Similarity: higher = more similar
+            is_match = (val >= match_threshold);
+            is_non_match = (val < non_match_threshold);
+          } else {
+            // Distance: lower = more similar
+            is_match = (val <= match_threshold);
+            is_non_match = (val > non_match_threshold);
+          }
+
+          if (same_label && is_match) {
+            category = CATEGORY_TRUE_MATCH;
+            emit = (include_flags & INCLUDE_TM);
+          } else if (!same_label && is_match) {
+            category = CATEGORY_FALSE_MATCH;
+            emit = (include_flags & INCLUDE_FM);
+          } else if (same_label && is_non_match) {
+            category = CATEGORY_FALSE_NON_MATCH;
+            emit = (include_flags & INCLUDE_FNM);
+          } else if (!same_label && is_non_match) {
+            category = CATEGORY_TRUE_NON_MATCH;
+            emit = (include_flags & INCLUDE_TNM);
+          }
+          // Pairs in gap between thresholds are not emitted
+        } else {
+          // No labels: emit all pairs (no classification)
+          category = 0xFF;  // Unclassified
+          emit = true;
         }
-        if (collect_pairs && val < threshold && pairs && match_count) {
+
+        if (emit) {
           unsigned int idx = atomicAdd(match_count, 1);
           if (idx < max_pairs) {
-            pairs[idx] = make_uint2(gi, gj);
+            pair_indices[idx * 2] = gi;
+            pair_indices[idx * 2 + 1] = gj;
+            if (categories) categories[idx] = category;
+            if (out_distances) out_distances[idx] = val;
           }
         }
       };
@@ -749,9 +853,13 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B, float *dD, bool write_output, bool collect_pairs,
-    float threshold, uint2 *dPairs, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream) {
+    int M_A, int M_B,
+    const int32_t *dLabels_A, const int32_t *dLabels_B,
+    float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
+    cudaStream_t stream) {
   // Preprocess both A and B sets
   int total_A = M_A * K_WORDS;
   int total_B = M_B * K_WORDS;
@@ -768,6 +876,8 @@ extern "C" void launch_masked_hamming_ab_cuda(
       sizeof(uint32_t);
 
   min_hamming_ab_kernel<<<grid, block, smem, stream>>>(
-      dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, dD, write_output,
-      collect_pairs, threshold, dPairs, dMatchCount, max_pairs);
+      dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B,
+      dLabels_A, dLabels_B, match_threshold, non_match_threshold,
+      is_similarity, include_flags, dPairIndices, dCategories, dOutDistances,
+      dMatchCount, max_pairs);
 }

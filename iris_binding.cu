@@ -7,16 +7,22 @@
 
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    float *dD, bool write_output, bool collect_pairs, float threshold,
-    uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
+    const int32_t *dLabels, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream);
 
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B, float *dD, bool write_output, bool collect_pairs,
-    float threshold, uint2 *dPairs, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream);
+    int M_A, int M_B,
+    const int32_t *dLabels_A, const int32_t *dLabels_B,
+    float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
+    cudaStream_t stream);
 
 extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
                                              cudaStream_t stream);
@@ -26,8 +32,11 @@ extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   cudaStream_t stream);
 
 std::vector<torch::Tensor>
-masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
-                    bool collect_pairs, double threshold, int64_t max_pairs) {
+masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
+                    std::optional<torch::Tensor> labels,
+                    double match_threshold, double non_match_threshold,
+                    bool is_similarity, int64_t include_flags,
+                    int64_t max_pairs) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kInt, "data dtype must be int32");
@@ -41,67 +50,95 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask, bool write_output,
   int64_t M = data.size(0);
   auto opts_int = data.options();
   auto opts_float = data.options().dtype(torch::kFloat32);
+  auto opts_byte = data.options().dtype(torch::kUInt8);
+
+  // Validate labels if provided
+  if (labels.has_value()) {
+    TORCH_CHECK(labels->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels->scalar_type() == at::kInt, "labels dtype must be int32");
+    TORCH_CHECK(labels->is_contiguous(), "labels must be contiguous");
+    TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
+                "labels must have shape [M]");
+  }
 
   // Buffers
   auto premasked = torch::zeros_like(data);
-  torch::Tensor D;
-  if (write_output) {
-    D = torch::zeros({M, M}, opts_float);
-  }
 
   // GPU buffers for kernel output
-  torch::Tensor pairs_gpu;
-  torch::Tensor match_count_gpu;
-  // Pinned CPU buffers for async copy destination
-  torch::Tensor pairs_cpu;
-  torch::Tensor match_count_cpu;
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
 
-  if (collect_pairs && max_pairs > 0) {
-    // GPU buffers for kernel to write to
-    pairs_gpu = torch::zeros({max_pairs, 2}, opts_int);
-    match_count_gpu = torch::zeros({1}, opts_int);
+  // Pinned CPU buffers for async copy
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
 
-    // Pinned CPU buffers for async copy
-    auto cpu_opts = torch::TensorOptions()
-                        .device(torch::kCPU)
-                        .dtype(torch::kInt32)
-                        .pinned_memory(true);
-    pairs_cpu = torch::zeros({max_pairs, 2}, cpu_opts);
-    match_count_cpu = torch::zeros({1}, cpu_opts);
-  }
+  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
+  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
+  auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
+  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_masked_hamming_cuda(
       reinterpret_cast<uint32_t *>(data.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(mask.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(premasked.data_ptr<int>()), (int)M,
-      write_output ? D.data_ptr<float>() : nullptr, write_output, collect_pairs,
-      (float)threshold,
-      collect_pairs && max_pairs > 0
-          ? reinterpret_cast<uint2 *>(pairs_gpu.data_ptr<int>())
-          : nullptr,
-      collect_pairs && max_pairs > 0
-          ? reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>())
-          : nullptr,
+      labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      distances_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
-  // Async copy results to pinned host memory
-  if (collect_pairs && max_pairs > 0) {
-    cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
-                    sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(pairs_cpu.data_ptr(), pairs_gpu.data_ptr(),
-                    max_pairs * 2 * sizeof(int), cudaMemcpyDeviceToHost,
-                    stream);
+  // Copy count first and sync to know how many pairs to copy
+  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+                  sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  // Clamp to max_pairs in case kernel wrote more
+  if (actual_count > max_pairs) {
+    actual_count = max_pairs;
   }
 
-  // Return CPU tensors - caller must sync stream before reading
-  return {D, pairs_cpu, match_count_cpu};
+  // Only copy the valid entries
+  if (actual_count > 0) {
+    cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  }
+
+  // Return sliced tensors with only valid entries
+  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
+  auto categories_out = categories_cpu.slice(0, 0, actual_count);
+  auto distances_out = distances_cpu.slice(0, 0, actual_count);
+
+  return {pair_indices_out, categories_out, distances_out, match_count_cpu};
 }
 
 std::vector<torch::Tensor>
 masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
                        torch::Tensor data_b, torch::Tensor mask_b,
-                       bool write_output, bool collect_pairs, double threshold,
+                       std::optional<torch::Tensor> labels_a,
+                       std::optional<torch::Tensor> labels_b,
+                       double match_threshold, double non_match_threshold,
+                       bool is_similarity, int64_t include_flags,
                        int64_t max_pairs) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(mask_a.is_cuda(), "mask_a must be CUDA");
@@ -126,35 +163,54 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
   int64_t M_B = data_b.size(0);
   auto opts_int = data_a.options();
   auto opts_float = data_a.options().dtype(torch::kFloat32);
+  auto opts_byte = data_a.options().dtype(torch::kUInt8);
+
+  // Validate labels if provided (both must be provided or neither)
+  bool has_labels = labels_a.has_value() && labels_b.has_value();
+  if (labels_a.has_value() || labels_b.has_value()) {
+    TORCH_CHECK(has_labels, "Both labels_a and labels_b must be provided, or neither");
+  }
+  if (has_labels) {
+    TORCH_CHECK(labels_a->is_cuda(), "labels_a must be CUDA");
+    TORCH_CHECK(labels_b->is_cuda(), "labels_b must be CUDA");
+    TORCH_CHECK(labels_a->scalar_type() == at::kInt, "labels_a dtype must be int32");
+    TORCH_CHECK(labels_b->scalar_type() == at::kInt, "labels_b dtype must be int32");
+    TORCH_CHECK(labels_a->is_contiguous(), "labels_a must be contiguous");
+    TORCH_CHECK(labels_b->is_contiguous(), "labels_b must be contiguous");
+    TORCH_CHECK(labels_a->dim() == 1 && labels_a->size(0) == M_A,
+                "labels_a must have shape [M_A]");
+    TORCH_CHECK(labels_b->dim() == 1 && labels_b->size(0) == M_B,
+                "labels_b must have shape [M_B]");
+  }
 
   // Buffers
   auto premasked_a = torch::zeros_like(data_a);
   auto premasked_b = torch::zeros_like(data_b);
-  torch::Tensor D;
-  if (write_output) {
-    D = torch::zeros({M_A, M_B}, opts_float);
-  }
 
   // GPU buffers for kernel output
-  torch::Tensor pairs_gpu;
-  torch::Tensor match_count_gpu;
-  // Pinned CPU buffers for async copy destination
-  torch::Tensor pairs_cpu;
-  torch::Tensor match_count_cpu;
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
 
-  if (collect_pairs && max_pairs > 0) {
-    // GPU buffers for kernel to write to
-    pairs_gpu = torch::zeros({max_pairs, 2}, opts_int);
-    match_count_gpu = torch::zeros({1}, opts_int);
+  // Pinned CPU buffers for async copy
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
 
-    // Pinned CPU buffers for async copy
-    auto cpu_opts = torch::TensorOptions()
-                        .device(torch::kCPU)
-                        .dtype(torch::kInt32)
-                        .pinned_memory(true);
-    pairs_cpu = torch::zeros({max_pairs, 2}, cpu_opts);
-    match_count_cpu = torch::zeros({1}, cpu_opts);
-  }
+  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
+  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
+  auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
+  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_masked_hamming_ab_cuda(
@@ -163,28 +219,45 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
       reinterpret_cast<uint32_t *>(premasked_a.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(data_b.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(mask_b.data_ptr<int>()),
-      reinterpret_cast<uint32_t *>(premasked_b.data_ptr<int>()), (int)M_A,
-      (int)M_B, write_output ? D.data_ptr<float>() : nullptr, write_output,
-      collect_pairs, (float)threshold,
-      collect_pairs && max_pairs > 0
-          ? reinterpret_cast<uint2 *>(pairs_gpu.data_ptr<int>())
-          : nullptr,
-      collect_pairs && max_pairs > 0
-          ? reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>())
-          : nullptr,
+      reinterpret_cast<uint32_t *>(premasked_b.data_ptr<int>()),
+      (int)M_A, (int)M_B,
+      has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
+      has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      distances_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
-  // Async copy results to pinned host memory
-  if (collect_pairs && max_pairs > 0) {
-    cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
-                    sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(pairs_cpu.data_ptr(), pairs_gpu.data_ptr(),
-                    max_pairs * 2 * sizeof(int), cudaMemcpyDeviceToHost,
-                    stream);
+  // Copy count first and sync to know how many pairs to copy
+  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+                  sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  // Clamp to max_pairs in case kernel wrote more
+  if (actual_count > max_pairs) {
+    actual_count = max_pairs;
   }
 
-  // Return CPU tensors - caller must sync stream before reading
-  return {D, pairs_cpu, match_count_cpu};
+  // Only copy the valid entries
+  if (actual_count > 0) {
+    cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  }
+
+  // Return sliced tensors with only valid entries
+  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
+  auto categories_out = categories_cpu.slice(0, 0, actual_count);
+  auto distances_out = distances_cpu.slice(0, 0, actual_count);
+
+  return {pair_indices_out, categories_out, distances_out, match_count_cpu};
 }
 
 torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
@@ -238,11 +311,38 @@ torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("masked_hamming_cuda", &masked_hamming_cuda,
-        "Masked hamming distance (CUDA)");
+        "Masked hamming distance with classification (CUDA)",
+        py::arg("data"), py::arg("mask"),
+        py::arg("labels") = py::none(),
+        py::arg("match_threshold") = 0.35,
+        py::arg("non_match_threshold") = 0.35,
+        py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000);
   m.def("masked_hamming_ab_cuda", &masked_hamming_ab_cuda,
-        "Masked hamming distance between two sets A and B (CUDA)");
+        "Masked hamming distance between two sets A and B with classification (CUDA)",
+        py::arg("data_a"), py::arg("mask_a"),
+        py::arg("data_b"), py::arg("mask_b"),
+        py::arg("labels_a") = py::none(),
+        py::arg("labels_b") = py::none(),
+        py::arg("match_threshold") = 0.35,
+        py::arg("non_match_threshold") = 0.35,
+        py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000);
   m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
         "Pack iris bits to theta-major int32 words (CUDA)");
   m.def("repack_to_theta_major_cuda", &repack_to_theta_major_cuda,
         "Repack int32 words from r-major to theta-major order (CUDA)");
+
+  // Export classification constants
+  m.attr("CATEGORY_TRUE_MATCH") = py::int_(CATEGORY_TRUE_MATCH);
+  m.attr("CATEGORY_FALSE_MATCH") = py::int_(CATEGORY_FALSE_MATCH);
+  m.attr("CATEGORY_FALSE_NON_MATCH") = py::int_(CATEGORY_FALSE_NON_MATCH);
+  m.attr("CATEGORY_TRUE_NON_MATCH") = py::int_(CATEGORY_TRUE_NON_MATCH);
+  m.attr("INCLUDE_TM") = py::int_(INCLUDE_TM);
+  m.attr("INCLUDE_FM") = py::int_(INCLUDE_FM);
+  m.attr("INCLUDE_FNM") = py::int_(INCLUDE_FNM);
+  m.attr("INCLUDE_TNM") = py::int_(INCLUDE_TNM);
+  m.attr("INCLUDE_ALL") = py::int_(INCLUDE_ALL);
 }
