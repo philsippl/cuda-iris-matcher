@@ -46,3 +46,18 @@ constexpr int TILES_N = BLOCK_N / WMMA_N;
 constexpr int WARPS_PER_ROW = TILES_M / TILES_M_PER_WARP;
 constexpr int WARPS_PER_COL = TILES_N / TILES_N_PER_WARP;
 constexpr int WARPS_PER_BLOCK = WARPS_PER_ROW * WARPS_PER_COL;
+
+// ----------------- Classification categories -----------------
+// Match classification for biometric verification
+// Category encoding: 2 bits (0-3)
+constexpr uint8_t CATEGORY_TRUE_MATCH = 0;       // Same label, distance <= match_threshold
+constexpr uint8_t CATEGORY_FALSE_MATCH = 1;      // Diff label, distance <= match_threshold
+constexpr uint8_t CATEGORY_FALSE_NON_MATCH = 2;  // Same label, distance > non_match_threshold
+constexpr uint8_t CATEGORY_TRUE_NON_MATCH = 3;   // Diff label, distance > non_match_threshold
+
+// Include flags bitmask
+constexpr uint8_t INCLUDE_TM = 0x1;   // Include True Matches
+constexpr uint8_t INCLUDE_FM = 0x2;   // Include False Matches
+constexpr uint8_t INCLUDE_FNM = 0x4;  // Include False Non-Matches
+constexpr uint8_t INCLUDE_TNM = 0x8;  // Include True Non-Matches
+constexpr uint8_t INCLUDE_ALL = 0xF;  // Include all categories

@@ -18,16 +18,22 @@
 // External launchers from iris.cu
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    float *dD, bool write_output, bool collect_pairs, float threshold,
-    uint2 *dPairs, unsigned int *dMatchCount, unsigned int max_pairs,
+    const int32_t *dLabels, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream);
 
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B, float *dD, bool write_output, bool collect_pairs,
-    float threshold, uint2 *dPairs, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream);
+    int M_A, int M_B,
+    const int32_t *dLabels_A, const int32_t *dLabels_B,
+    float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs,
+    cudaStream_t stream);
 
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
@@ -113,8 +119,9 @@ int main(int argc, char **argv) {
 
   // Allocate device memory
   uint32_t *d_data, *d_mask, *d_premasked;
-  float *d_D = nullptr; // Don't allocate full distance matrix
-  uint2 *d_pairs;
+  int32_t *d_pair_indices;
+  uint8_t *d_categories;
+  float *d_distances;
   unsigned int *d_match_count;
 
   unsigned int max_pairs = 1000000;
@@ -122,7 +129,9 @@ int main(int argc, char **argv) {
   CHECK_CUDA(cudaMalloc(&d_data, data_size));
   CHECK_CUDA(cudaMalloc(&d_mask, data_size));
   CHECK_CUDA(cudaMalloc(&d_premasked, data_size));
-  CHECK_CUDA(cudaMalloc(&d_pairs, max_pairs * sizeof(uint2)));
+  CHECK_CUDA(cudaMalloc(&d_pair_indices, max_pairs * 2 * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_categories, max_pairs * sizeof(uint8_t)));
+  CHECK_CUDA(cudaMalloc(&d_distances, max_pairs * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_match_count, sizeof(unsigned int)));
 
   printf("Copying data to GPU... ");
@@ -144,11 +153,14 @@ int main(int argc, char **argv) {
   fflush(stdout);
   for (int i = 0; i < warmup_iters; i++) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
-    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, d_D,
-                               false, // write_output
-                               true,  // collect_pairs
-                               0.3f,  // threshold
-                               d_pairs, d_match_count, max_pairs, stream);
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
+                               nullptr,  // labels (none)
+                               0.3f,     // match_threshold
+                               0.3f,     // non_match_threshold
+                               false,    // is_similarity
+                               INCLUDE_ALL,
+                               d_pair_indices, d_categories, d_distances,
+                               d_match_count, max_pairs, stream);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   printf("done\n\n");
@@ -163,11 +175,14 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
 
     CHECK_CUDA(cudaEventRecord(start, stream));
-    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, d_D,
-                               false, // write_output
-                               true,  // collect_pairs
-                               0.3f,  // threshold
-                               d_pairs, d_match_count, max_pairs, stream);
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
+                               nullptr,  // labels (none)
+                               0.3f,     // match_threshold
+                               0.3f,     // non_match_threshold
+                               false,    // is_similarity
+                               INCLUDE_ALL,
+                               d_pair_indices, d_categories, d_distances,
+                               d_match_count, max_pairs, stream);
     CHECK_CUDA(cudaEventRecord(stop, stream));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -258,10 +273,16 @@ int main(int argc, char **argv) {
   fflush(stdout);
   for (int i = 0; i < warmup_iters; i++) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
-    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A, d_data_B,
-                                  d_mask_B, d_premasked_B, M_A, M_B, nullptr,
-                                  false, true, 0.3f, d_pairs, d_match_count,
-                                  max_pairs, stream);
+    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A,
+                                  d_data_B, d_mask_B, d_premasked_B,
+                                  M_A, M_B,
+                                  nullptr, nullptr,  // labels (none)
+                                  0.3f,     // match_threshold
+                                  0.3f,     // non_match_threshold
+                                  false,    // is_similarity
+                                  INCLUDE_ALL,
+                                  d_pair_indices, d_categories, d_distances,
+                                  d_match_count, max_pairs, stream);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   printf("done\n");
@@ -274,10 +295,16 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
 
     CHECK_CUDA(cudaEventRecord(start, stream));
-    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A, d_data_B,
-                                  d_mask_B, d_premasked_B, M_A, M_B, nullptr,
-                                  false, true, 0.3f, d_pairs, d_match_count,
-                                  max_pairs, stream);
+    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A,
+                                  d_data_B, d_mask_B, d_premasked_B,
+                                  M_A, M_B,
+                                  nullptr, nullptr,  // labels (none)
+                                  0.3f,     // match_threshold
+                                  0.3f,     // non_match_threshold
+                                  false,    // is_similarity
+                                  INCLUDE_ALL,
+                                  d_pair_indices, d_categories, d_distances,
+                                  d_match_count, max_pairs, stream);
     CHECK_CUDA(cudaEventRecord(stop, stream));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -332,7 +359,9 @@ int main(int argc, char **argv) {
   CHECK_CUDA(cudaFree(d_data));
   CHECK_CUDA(cudaFree(d_mask));
   CHECK_CUDA(cudaFree(d_premasked));
-  CHECK_CUDA(cudaFree(d_pairs));
+  CHECK_CUDA(cudaFree(d_pair_indices));
+  CHECK_CUDA(cudaFree(d_categories));
+  CHECK_CUDA(cudaFree(d_distances));
   CHECK_CUDA(cudaFree(d_match_count));
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
