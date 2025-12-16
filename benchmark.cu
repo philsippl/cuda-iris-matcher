@@ -18,19 +18,19 @@
 // External launchers from iris.cu
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    const int32_t *dLabels, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
-    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream);
+    int r_dim, int theta_dim, const int32_t *dLabels, float match_threshold,
+    float non_match_threshold, bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream);
 
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B, const int32_t *dLabels_A, const int32_t *dLabels_B,
-    float match_threshold, float non_match_threshold, bool is_similarity,
-    uint8_t include_flags, int32_t *dPairIndices, uint8_t *dCategories,
-    float *dOutDistances, unsigned int *dMatchCount, unsigned int max_pairs,
-    cudaStream_t stream);
+    int M_A, int M_B, int r_dim, int theta_dim, const int32_t *dLabels_A,
+    const int32_t *dLabels_B, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
+    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
 
 // Check if using tensor cores or fallback
 // b1 MMA is available on SM80-SM90 (Ampere, Ada, Hopper)
@@ -100,14 +100,15 @@ void print_gpu_info() {
   printf("\n");
 }
 
-void print_kernel_config(int M) {
+void print_kernel_config(int M, const IrisConfig &cfg) {
   printf("=== Kernel Config ===\n");
   printf("M (samples): %d\n", M);
-  printf("K_BITS: %d, K_WORDS: %d\n", K_BITS, K_WORDS);
+  printf("Iris shape: (%d, %d, 2, 2)\n", cfg.r_dim, cfg.theta_dim);
+  printf("K_BITS: %d, K_WORDS: %d\n", cfg.k_bits, cfg.k_words);
   printf("Block size: BLOCK_M=%d, BLOCK_N=%d\n", BLOCK_M, BLOCK_N);
   printf("Warps per block: %d\n", WARPS_PER_BLOCK);
   printf("Tiles per warp: %dx%d\n", TILES_M_PER_WARP, TILES_N_PER_WARP);
-  printf("K chunks: %d (chunk words: %d)\n", K_CHUNKS, K_CHUNK_WORDS);
+  printf("K chunks: %d (chunk words: %d)\n", cfg.k_chunks, K_CHUNK_WORDS);
   printf("Shift range: [-%d, +%d] (%d shifts)\n", MAX_SHIFT, MAX_SHIFT,
          NUM_SHIFTS);
 
@@ -126,11 +127,14 @@ int main(int argc, char **argv) {
   int warmup_iters = (argc > 2) ? atoi(argv[2]) : 5;
   int bench_iters = (argc > 3) ? atoi(argv[3]) : 20;
 
+  // Use default iris configuration
+  IrisConfig cfg = IrisConfig::default_config();
+
   printf("Iris Kernel Benchmark\n");
   printf("=====================\n\n");
 
   print_gpu_info();
-  print_kernel_config(M);
+  print_kernel_config(M, cfg);
 
   printf("=== Benchmark Settings ===\n");
   printf("Warmup iterations: %d\n", warmup_iters);
@@ -140,14 +144,14 @@ int main(int argc, char **argv) {
   srand(42);
 
   // Allocate host memory
-  size_t data_size = (size_t)M * K_WORDS * sizeof(uint32_t);
+  size_t data_size = (size_t)M * cfg.k_words * sizeof(uint32_t);
   uint32_t *h_data = (uint32_t *)malloc(data_size);
   uint32_t *h_mask = (uint32_t *)malloc(data_size);
 
   printf("Generating random data... ");
   fflush(stdout);
-  fill_random(h_data, M * K_WORDS);
-  fill_random(h_mask, M * K_WORDS);
+  fill_random(h_data, M * cfg.k_words);
+  fill_random(h_mask, M * cfg.k_words);
   printf("done\n");
 
   // Allocate device memory
@@ -186,7 +190,8 @@ int main(int argc, char **argv) {
   fflush(stdout);
   for (int i = 0; i < warmup_iters; i++) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
-    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, cfg.r_dim,
+                               cfg.theta_dim,
                                nullptr, // labels (none)
                                0.3f,    // match_threshold
                                0.3f,    // non_match_threshold
@@ -207,7 +212,8 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
 
     CHECK_CUDA(cudaEventRecord(start, stream));
-    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
+    launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M, cfg.r_dim,
+                               cfg.theta_dim,
                                nullptr, // labels (none)
                                0.3f,    // match_threshold
                                0.3f,    // non_match_threshold
@@ -243,9 +249,9 @@ int main(int argc, char **argv) {
   // Calculate performance metrics
   // Lower triangle comparisons: M*(M-1)/2
   double comparisons = (double)M * (M - 1) / 2.0;
-  // Each comparison does NUM_SHIFTS shifts, K_CHUNKS chunks
+  // Each comparison does NUM_SHIFTS shifts, k_chunks chunks
   // Each chunk: 3 MMA ops (16x8x256), each MMA is 16*8*256 = 32768 ops
-  double mma_ops_per_comparison = NUM_SHIFTS * K_CHUNKS * 3 * 16 * 8 * 256;
+  double mma_ops_per_comparison = NUM_SHIFTS * cfg.k_chunks * 3 * 16 * 8 * 256;
   double total_ops = comparisons * mma_ops_per_comparison;
   double tops = total_ops / (mean * 1e-3) / 1e12;
 
@@ -274,13 +280,13 @@ int main(int argc, char **argv) {
 
   // Allocate separate A and B buffers (reuse h_data/h_mask for A, generate new
   // for B)
-  size_t data_size_A = (size_t)M_A * K_WORDS * sizeof(uint32_t);
-  size_t data_size_B = (size_t)M_B * K_WORDS * sizeof(uint32_t);
+  size_t data_size_A = (size_t)M_A * cfg.k_words * sizeof(uint32_t);
+  size_t data_size_B = (size_t)M_B * cfg.k_words * sizeof(uint32_t);
 
   uint32_t *h_data_B = (uint32_t *)malloc(data_size_B);
   uint32_t *h_mask_B = (uint32_t *)malloc(data_size_B);
-  fill_random(h_data_B, M_B * K_WORDS);
-  fill_random(h_mask_B, M_B * K_WORDS);
+  fill_random(h_data_B, M_B * cfg.k_words);
+  fill_random(h_mask_B, M_B * cfg.k_words);
 
   uint32_t *d_data_A, *d_mask_A, *d_premasked_A;
   uint32_t *d_data_B, *d_mask_B, *d_premasked_B;
@@ -306,10 +312,10 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
     launch_masked_hamming_ab_cuda(
         d_data_A, d_mask_A, d_premasked_A, d_data_B, d_mask_B, d_premasked_B,
-        M_A, M_B, nullptr, nullptr, // labels (none)
-        0.3f,                       // match_threshold
-        0.3f,                       // non_match_threshold
-        false,                      // is_similarity
+        M_A, M_B, cfg.r_dim, cfg.theta_dim, nullptr, nullptr, // labels (none)
+        0.3f,                                                 // match_threshold
+        0.3f,  // non_match_threshold
+        false, // is_similarity
         INCLUDE_ALL, d_pair_indices, d_categories, d_distances, d_match_count,
         max_pairs, stream);
   }
@@ -326,10 +332,10 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaEventRecord(start, stream));
     launch_masked_hamming_ab_cuda(
         d_data_A, d_mask_A, d_premasked_A, d_data_B, d_mask_B, d_premasked_B,
-        M_A, M_B, nullptr, nullptr, // labels (none)
-        0.3f,                       // match_threshold
-        0.3f,                       // non_match_threshold
-        false,                      // is_similarity
+        M_A, M_B, cfg.r_dim, cfg.theta_dim, nullptr, nullptr, // labels (none)
+        0.3f,                                                 // match_threshold
+        0.3f,  // non_match_threshold
+        false, // is_similarity
         INCLUDE_ALL, d_pair_indices, d_categories, d_distances, d_match_count,
         max_pairs, stream);
     CHECK_CUDA(cudaEventRecord(stop, stream));

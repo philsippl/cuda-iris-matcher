@@ -18,6 +18,12 @@ INCLUDE_FNM = _C.INCLUDE_FNM
 INCLUDE_TNM = _C.INCLUDE_TNM
 INCLUDE_ALL = _C.INCLUDE_ALL
 
+# Export default dimensions
+DEFAULT_R_DIM = _C.DEFAULT_R_DIM
+DEFAULT_THETA_DIM = _C.DEFAULT_THETA_DIM
+DEFAULT_D0_DIM = _C.DEFAULT_D0_DIM
+DEFAULT_D1_DIM = _C.DEFAULT_D1_DIM
+
 
 def masked_hamming_cuda(
     data: torch.Tensor,
@@ -28,14 +34,19 @@ def masked_hamming_cuda(
     is_similarity: bool = False,
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
+    r_dim: int = DEFAULT_R_DIM,
+    theta_dim: int = DEFAULT_THETA_DIM,
+    d0_dim: int = DEFAULT_D0_DIM,
+    d1_dim: int = DEFAULT_D1_DIM,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute minimum fractional hamming distance for all pairs within a single set.
     Only the lower triangle (i > j) is computed.
 
     Args:
-        data: CUDA int32 contiguous tensor of shape [M, 400] (packed iris codes)
-        mask: CUDA int32 contiguous tensor of shape [M, 400] (packed masks)
+        data: CUDA int32 contiguous tensor of shape [M, k_words] (packed iris codes)
+              where k_words = r_dim * theta_dim * d0_dim * d1_dim / 32
+        mask: CUDA int32 contiguous tensor of shape [M, k_words] (packed masks)
         labels: Optional CUDA int32 tensor of shape [M] with identity labels.
                 If None, no classification is performed and all pairs are returned.
         match_threshold: Threshold for match classification (default: 0.35)
@@ -45,6 +56,10 @@ def masked_hamming_cuda(
         include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
                        Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        r_dim: Radial dimension of iris code (default: 16)
+        theta_dim: Angular dimension of iris code (default: 200)
+        d0_dim: First inner dimension (default: 2)
+        d1_dim: Second inner dimension (default: 2)
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -60,7 +75,8 @@ def masked_hamming_cuda(
     return _C.masked_hamming_cuda(
         data, mask, labels,
         match_threshold, non_match_threshold,
-        is_similarity, include_flags, max_pairs
+        is_similarity, include_flags, max_pairs,
+        r_dim, theta_dim, d0_dim, d1_dim
     )
 
 
@@ -76,16 +92,21 @@ def masked_hamming_ab_cuda(
     is_similarity: bool = False,
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
+    r_dim: int = DEFAULT_R_DIM,
+    theta_dim: int = DEFAULT_THETA_DIM,
+    d0_dim: int = DEFAULT_D0_DIM,
+    d1_dim: int = DEFAULT_D1_DIM,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute minimum fractional hamming distance between two different sets A and B.
     Computes the full M_A x M_B matrix (not just lower triangle).
 
     Args:
-        data_a: CUDA int32 contiguous tensor of shape [M_A, 400] (packed iris codes)
-        mask_a: CUDA int32 contiguous tensor of shape [M_A, 400] (packed masks)
-        data_b: CUDA int32 contiguous tensor of shape [M_B, 400] (packed iris codes)
-        mask_b: CUDA int32 contiguous tensor of shape [M_B, 400] (packed masks)
+        data_a: CUDA int32 contiguous tensor of shape [M_A, k_words] (packed iris codes)
+        mask_a: CUDA int32 contiguous tensor of shape [M_A, k_words] (packed masks)
+        data_b: CUDA int32 contiguous tensor of shape [M_B, k_words] (packed iris codes)
+        mask_b: CUDA int32 contiguous tensor of shape [M_B, k_words] (packed masks)
+              where k_words = r_dim * theta_dim * d0_dim * d1_dim / 32
         labels_a: Optional CUDA int32 tensor of shape [M_A] with identity labels.
         labels_b: Optional CUDA int32 tensor of shape [M_B] with identity labels.
                   Both labels_a and labels_b must be provided, or neither.
@@ -97,6 +118,10 @@ def masked_hamming_ab_cuda(
         include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
                        Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        r_dim: Radial dimension of iris code (default: 16)
+        theta_dim: Angular dimension of iris code (default: 200)
+        d0_dim: First inner dimension (default: 2)
+        d1_dim: Second inner dimension (default: 2)
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -113,35 +138,58 @@ def masked_hamming_ab_cuda(
         data_a, mask_a, data_b, mask_b,
         labels_a, labels_b,
         match_threshold, non_match_threshold,
-        is_similarity, include_flags, max_pairs
+        is_similarity, include_flags, max_pairs,
+        r_dim, theta_dim, d0_dim, d1_dim
     )
 
 
-def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
+def pack_theta_major_cuda(
+    bits: torch.Tensor,
+    r_dim: int = DEFAULT_R_DIM,
+    theta_dim: int = DEFAULT_THETA_DIM,
+    d0_dim: int = DEFAULT_D0_DIM,
+    d1_dim: int = DEFAULT_D1_DIM,
+) -> torch.Tensor:
     """
     Pack iris code bits into theta-major int32 words using CUDA.
 
     Args:
-        bits: CUDA uint8 tensor of shape (M, 16, 200, 2, 2) with values in {0, 1}.
+        bits: CUDA uint8 tensor of shape (M, r_dim, theta_dim, d0_dim, d1_dim) with values in {0, 1}.
               Modified in-place; do not use after this call.
+        r_dim: Radial dimension of iris code (default: 16)
+        theta_dim: Angular dimension of iris code (default: 200)
+        d0_dim: First inner dimension (default: 2)
+        d1_dim: Second inner dimension (default: 2)
 
     Returns:
-        Packed int32 tensor of shape (M, 400). Shares storage with input
-        (no additional memory allocation).
+        Packed int32 tensor of shape (M, k_words) where k_words = r_dim * theta_dim * d0_dim * d1_dim / 32.
+        Shares storage with input (no additional memory allocation).
+
+    Constraints:
+        - r_dim * d0_dim * d1_dim must be divisible by 32 (for whole-word theta shifts)
+        - r_dim * theta_dim * d0_dim * d1_dim must be divisible by 256 (TensorCore alignment)
     """
-    return _C.pack_theta_major_cuda(bits)
+    return _C.pack_theta_major_cuda(bits, r_dim, theta_dim, d0_dim, d1_dim)
 
 
-def repack_to_theta_major_cuda(input: torch.Tensor) -> torch.Tensor:
+def repack_to_theta_major_cuda(
+    input: torch.Tensor,
+    r_dim: int = DEFAULT_R_DIM,
+    theta_dim: int = DEFAULT_THETA_DIM,
+    d0_dim: int = DEFAULT_D0_DIM,
+    d1_dim: int = DEFAULT_D1_DIM,
+) -> torch.Tensor:
     """
     Repack int32 words from r-major to theta-major order using CUDA.
 
     Args:
-        input: CUDA int32 tensor of shape (M, 400) packed in r-major order.
-               Original layout: bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
+        input: CUDA int32 tensor of shape (M, k_words) packed in r-major order.
+        r_dim: Radial dimension of iris code (default: 16)
+        theta_dim: Angular dimension of iris code (default: 200)
+        d0_dim: First inner dimension (default: 2)
+        d1_dim: Second inner dimension (default: 2)
 
     Returns:
-        New CUDA int32 tensor of shape (M, 400) packed in theta-major order.
-        Output layout: bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+        New CUDA int32 tensor of shape (M, k_words) packed in theta-major order.
     """
-    return _C.repack_to_theta_major_cuda(input)
+    return _C.repack_to_theta_major_cuda(input, r_dim, theta_dim, d0_dim, d1_dim)
