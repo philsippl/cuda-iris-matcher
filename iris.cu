@@ -21,13 +21,44 @@ static_assert(BLOCK_M % (WMMA_M * TILES_M_PER_WARP) == 0, "BLOCK_M constraint");
 static_assert(BLOCK_N % (WMMA_N * TILES_N_PER_WARP) == 0, "BLOCK_N constraint");
 static_assert(WARPS_PER_BLOCK * 32 <= 1024, "Too many threads");
 
-// ----------------- TensorCore MMA: b1 AND+POPC -----------------
+// ----------------- MMA: b1 AND+POPC (TensorCore + Fallback) -----------------
+//
+// Computes C[16x8] += popcount(A[16x256] & B[256x8]) using binary AND +
+// popcount. On SM80+ (Ampere): Uses native tensor core instruction. On older
+// GPUs: Uses scalar __popc with warp shuffles for data gathering.
+//
+// Fragment layout (same for both implementations):
+//   Thread lane l where group=l/4 (0-7), tid=l%4 (0-3):
+//   A fragments: a0=A[group, word tid], a1=A[group+8, word tid],
+//                a2=A[group, word tid+4], a3=A[group+8, word tid+4]
+//   B fragments: b0=B[col group, word tid], b1=B[col group, word tid+4]
+//   C outputs:   c0=C[group, tid*2], c1=C[group, tid*2+1],
+//                c2=C[group+8, tid*2], c3=C[group+8, tid*2+1]
+
+// Architecture detection for b1 MMA support:
+// - SM80-SM90 (Ampere, Ada, Hopper): Native mma.sync.aligned b1 instruction
+// - SM75 and below (Turing, Volta, Pascal): Fallback scalar implementation
+// - SM100+ (Blackwell): Uses new tcgen05.mma family, b1 MMA not available
+#define HAS_B1_MMA (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 1000)
+
+// Query which implementation is active (for benchmark reporting)
+__device__ __host__ inline bool mma_uses_tensor_cores() {
+#ifdef FORCE_FALLBACK
+  return false;
+#elif defined(__CUDA_ARCH__) && HAS_B1_MMA
+  return true;
+#else
+  return false;
+#endif
+}
 
 __device__ inline void mma_b1_and_popc_16x8x256(int32_t &c0, int32_t &c1,
                                                 int32_t &c2, int32_t &c3,
                                                 uint32_t a0, uint32_t a1,
                                                 uint32_t a2, uint32_t a3,
                                                 uint32_t b0, uint32_t b1) {
+#if !defined(FORCE_FALLBACK) && HAS_B1_MMA
+  // Native tensor core binary MMA (SM80+ / Ampere and newer)
   asm volatile("mma.sync.aligned.m16n8k256.row.col.s32.b1.b1.s32.and.popc "
                "{%0, %1, %2, %3}, "
                "{%4, %5, %6, %7}, "
@@ -35,6 +66,60 @@ __device__ inline void mma_b1_and_popc_16x8x256(int32_t &c0, int32_t &c1,
                "{%0, %1, %2, %3};\n"
                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+  // Fallback for pre-Ampere GPUs using scalar popcount + warp shuffles
+  int lane = threadIdx.x & 31;
+  int group = lane >> 2; // 0-7, determines which A rows this thread handles
+  int tid = lane & 3;    // 0-3, determines which B columns to compute
+
+  // Gather complete A rows for rows 'group' and 'group+8'
+  // Each row needs 8 words (256 bits), distributed across 4 threads in same
+  // group
+  uint32_t a_row0[8], a_row1[8];
+  int group_base = group * 4;
+
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    int src_lane = group_base + w;
+    a_row0[w] = __shfl_sync(0xffffffff, a0, src_lane);
+    a_row0[w + 4] = __shfl_sync(0xffffffff, a2, src_lane);
+    a_row1[w] = __shfl_sync(0xffffffff, a1, src_lane);
+    a_row1[w + 4] = __shfl_sync(0xffffffff, a3, src_lane);
+  }
+
+  // Gather B columns tid*2 and tid*2+1
+  // Each column needs 8 words, distributed across threads where group equals
+  // col
+  uint32_t b_col0[8], b_col1[8];
+  int col0 = tid * 2;
+  int col1 = tid * 2 + 1;
+
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    int src_lane0 = col0 * 4 + w;
+    int src_lane1 = col1 * 4 + w;
+    b_col0[w] = __shfl_sync(0xffffffff, b0, src_lane0);
+    b_col0[w + 4] = __shfl_sync(0xffffffff, b1, src_lane0);
+    b_col1[w] = __shfl_sync(0xffffffff, b0, src_lane1);
+    b_col1[w + 4] = __shfl_sync(0xffffffff, b1, src_lane1);
+  }
+
+  // Compute AND + popcount for each output element
+  int32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+
+#pragma unroll
+  for (int w = 0; w < 8; w++) {
+    acc0 += __popc(a_row0[w] & b_col0[w]); // C[group, tid*2]
+    acc1 += __popc(a_row0[w] & b_col1[w]); // C[group, tid*2+1]
+    acc2 += __popc(a_row1[w] & b_col0[w]); // C[group+8, tid*2]
+    acc3 += __popc(a_row1[w] & b_col1[w]); // C[group+8, tid*2+1]
+  }
+
+  c0 += acc0;
+  c1 += acc1;
+  c2 += acc2;
+  c3 += acc3;
+#endif
 }
 
 // ----------------- Fragment loaders -----------------

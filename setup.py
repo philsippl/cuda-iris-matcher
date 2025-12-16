@@ -15,6 +15,11 @@ def get_ext_modules():
     extra_cuda_cflags = ["-O3", "-std=c++17"]
     extra_cflags = ["-O3", "-std=c++17"]
 
+    # Support FORCE_FALLBACK=1 to build with scalar fallback instead of tensor cores
+    if os.environ.get("FORCE_FALLBACK", "0") == "1":
+        extra_cuda_cflags.append("-DFORCE_FALLBACK")
+        print("Building with FORCE_FALLBACK: using scalar __popc + warp shuffles")
+
     return [
         CUDAExtension(
             name="cuda_iris_matcher._C",

@@ -19,21 +19,35 @@
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
     const int32_t *dLabels, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags,
-    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
-    unsigned int *dMatchCount, unsigned int max_pairs,
-    cudaStream_t stream);
+    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
+    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
 
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B,
-    const int32_t *dLabels_A, const int32_t *dLabels_B,
-    float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags,
-    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
-    unsigned int *dMatchCount, unsigned int max_pairs,
+    int M_A, int M_B, const int32_t *dLabels_A, const int32_t *dLabels_B,
+    float match_threshold, float non_match_threshold, bool is_similarity,
+    uint8_t include_flags, int32_t *dPairIndices, uint8_t *dCategories,
+    float *dOutDistances, unsigned int *dMatchCount, unsigned int max_pairs,
     cudaStream_t stream);
+
+// Check if using tensor cores or fallback
+// b1 MMA is available on SM80-SM90 (Ampere, Ada, Hopper)
+// Not available on SM75 and below (Turing, Volta, Pascal)
+// Not available on SM100+ (Blackwell uses new tcgen05.mma family)
+inline bool uses_tensor_cores() {
+#ifdef FORCE_FALLBACK
+  return false;
+#else
+  int device;
+  cudaDeviceProp prop;
+  cudaGetDevice(&device);
+  cudaGetDeviceProperties(&prop, device);
+  int sm_version = prop.major * 10 + prop.minor;
+  return (sm_version >= 80 && sm_version < 100);
+#endif
+}
 
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
@@ -64,6 +78,25 @@ void print_gpu_info() {
   printf("Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
   printf("Memory bandwidth: %.0f GB/s\n",
          2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8) / 1e9);
+
+  // Print MMA implementation info
+  bool tensor_cores = uses_tensor_cores();
+  printf("MMA implementation: %s\n",
+         tensor_cores ? "TENSOR CORES (native b1 MMA)"
+                      : "FALLBACK (scalar __popc + warp shuffles)");
+#ifdef FORCE_FALLBACK
+  printf("  (FORCE_FALLBACK defined at compile time)\n");
+#else
+  if (!tensor_cores) {
+    int sm_version = prop.major * 10 + prop.minor;
+    if (sm_version < 80)
+      printf("  (SM%d < SM80: b1 MMA not available)\n", sm_version);
+    else if (sm_version >= 100)
+      printf("  (SM%d >= SM100 Blackwell: uses tcgen05.mma, legacy b1 MMA "
+             "unavailable)\n",
+             sm_version);
+  }
+#endif
   printf("\n");
 }
 
@@ -154,13 +187,12 @@ int main(int argc, char **argv) {
   for (int i = 0; i < warmup_iters; i++) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
     launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
-                               nullptr,  // labels (none)
-                               0.3f,     // match_threshold
-                               0.3f,     // non_match_threshold
-                               false,    // is_similarity
-                               INCLUDE_ALL,
-                               d_pair_indices, d_categories, d_distances,
-                               d_match_count, max_pairs, stream);
+                               nullptr, // labels (none)
+                               0.3f,    // match_threshold
+                               0.3f,    // non_match_threshold
+                               false,   // is_similarity
+                               INCLUDE_ALL, d_pair_indices, d_categories,
+                               d_distances, d_match_count, max_pairs, stream);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   printf("done\n\n");
@@ -176,13 +208,12 @@ int main(int argc, char **argv) {
 
     CHECK_CUDA(cudaEventRecord(start, stream));
     launch_masked_hamming_cuda(d_data, d_mask, d_premasked, M,
-                               nullptr,  // labels (none)
-                               0.3f,     // match_threshold
-                               0.3f,     // non_match_threshold
-                               false,    // is_similarity
-                               INCLUDE_ALL,
-                               d_pair_indices, d_categories, d_distances,
-                               d_match_count, max_pairs, stream);
+                               nullptr, // labels (none)
+                               0.3f,    // match_threshold
+                               0.3f,    // non_match_threshold
+                               false,   // is_similarity
+                               INCLUDE_ALL, d_pair_indices, d_categories,
+                               d_distances, d_match_count, max_pairs, stream);
     CHECK_CUDA(cudaEventRecord(stop, stream));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -273,16 +304,14 @@ int main(int argc, char **argv) {
   fflush(stdout);
   for (int i = 0; i < warmup_iters; i++) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
-    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A,
-                                  d_data_B, d_mask_B, d_premasked_B,
-                                  M_A, M_B,
-                                  nullptr, nullptr,  // labels (none)
-                                  0.3f,     // match_threshold
-                                  0.3f,     // non_match_threshold
-                                  false,    // is_similarity
-                                  INCLUDE_ALL,
-                                  d_pair_indices, d_categories, d_distances,
-                                  d_match_count, max_pairs, stream);
+    launch_masked_hamming_ab_cuda(
+        d_data_A, d_mask_A, d_premasked_A, d_data_B, d_mask_B, d_premasked_B,
+        M_A, M_B, nullptr, nullptr, // labels (none)
+        0.3f,                       // match_threshold
+        0.3f,                       // non_match_threshold
+        false,                      // is_similarity
+        INCLUDE_ALL, d_pair_indices, d_categories, d_distances, d_match_count,
+        max_pairs, stream);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   printf("done\n");
@@ -295,16 +324,14 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemset(d_match_count, 0, sizeof(unsigned int)));
 
     CHECK_CUDA(cudaEventRecord(start, stream));
-    launch_masked_hamming_ab_cuda(d_data_A, d_mask_A, d_premasked_A,
-                                  d_data_B, d_mask_B, d_premasked_B,
-                                  M_A, M_B,
-                                  nullptr, nullptr,  // labels (none)
-                                  0.3f,     // match_threshold
-                                  0.3f,     // non_match_threshold
-                                  false,    // is_similarity
-                                  INCLUDE_ALL,
-                                  d_pair_indices, d_categories, d_distances,
-                                  d_match_count, max_pairs, stream);
+    launch_masked_hamming_ab_cuda(
+        d_data_A, d_mask_A, d_premasked_A, d_data_B, d_mask_B, d_premasked_B,
+        M_A, M_B, nullptr, nullptr, // labels (none)
+        0.3f,                       // match_threshold
+        0.3f,                       // non_match_threshold
+        false,                      // is_similarity
+        INCLUDE_ALL, d_pair_indices, d_categories, d_distances, d_match_count,
+        max_pairs, stream);
     CHECK_CUDA(cudaEventRecord(stop, stream));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
