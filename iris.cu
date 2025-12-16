@@ -152,6 +152,64 @@ __device__ inline void load_b_frag(const uint32_t *Bs_ext, uint32_t &b0,
   b1 = Bs_ext[base + tid + 4];
 }
 
+// ----------------- Shared inner MMA body (templated, no macros)
+// ----------------- DO_C3 is compile-time, so phase 2 fully removes the c3 MMA
+// path (no runtime branch overhead).
+template <bool DO_C3>
+__device__ __forceinline__ void
+iris_accum_tiles(const uint32_t *A_pm_buf, const uint32_t *A_m_buf,
+                 const uint32_t *B_pm_buf, const uint32_t *B_m_buf,
+                 int tile_m_base, int tile_n_base,
+                 int32_t c1_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4],
+                 int32_t c2_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4],
+                 int32_t c3_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4]) {
+#pragma unroll
+  for (int tm = 0; tm < TILES_M_PER_WARP; ++tm) {
+    int row_off = (tile_m_base + tm) * WMMA_M * K_CHUNK_WORDS;
+    const uint32_t *A_pm_tile = A_pm_buf + row_off;
+    const uint32_t *A_m_tile = A_m_buf + row_off;
+
+    uint32_t a_pm0, a_pm1, a_pm2, a_pm3;
+    uint32_t a_m0, a_m1, a_m2, a_m3;
+    load_a_frag(A_pm_tile, a_pm0, a_pm1, a_pm2, a_pm3);
+    load_a_frag(A_m_tile, a_m0, a_m1, a_m2, a_m3);
+
+    uint32_t a_xp0 = a_m0 ^ a_pm0;
+    uint32_t a_xp1 = a_m1 ^ a_pm1;
+    uint32_t a_xp2 = a_m2 ^ a_pm2;
+    uint32_t a_xp3 = a_m3 ^ a_pm3;
+
+#pragma unroll
+    for (int tn = 0; tn < TILES_N_PER_WARP; ++tn) {
+      int col_off = (tile_n_base + tn) * WMMA_N * K_CHUNK_WORDS_EXT;
+      const uint32_t *B_pm_tile = B_pm_buf + col_off;
+      const uint32_t *B_m_tile = B_m_buf + col_off;
+
+      uint32_t b_pm0, b_pm1;
+      uint32_t b_m0, b_m1;
+      load_b_frag(B_pm_tile, b_pm0, b_pm1);
+      load_b_frag(B_m_tile, b_m0, b_m1);
+
+      uint32_t b_xp0 = b_m0 ^ b_pm0;
+      uint32_t b_xp1 = b_m1 ^ b_pm1;
+
+      mma_b1_and_popc_16x8x256(c1_frag[tm][tn][0], c1_frag[tm][tn][1],
+                               c1_frag[tm][tn][2], c1_frag[tm][tn][3], a_xp0,
+                               a_xp1, a_xp2, a_xp3, b_pm0, b_pm1);
+
+      mma_b1_and_popc_16x8x256(c2_frag[tm][tn][0], c2_frag[tm][tn][1],
+                               c2_frag[tm][tn][2], c2_frag[tm][tn][3], a_pm0,
+                               a_pm1, a_pm2, a_pm3, b_xp0, b_xp1);
+
+      if constexpr (DO_C3) {
+        mma_b1_and_popc_16x8x256(c3_frag[tm][tn][0], c3_frag[tm][tn][1],
+                                 c3_frag[tm][tn][2], c3_frag[tm][tn][3], a_m0,
+                                 a_m1, a_m2, a_m3, b_m0, b_m1);
+      }
+    }
+  }
+}
+
 // ----------------- Minimum Fractional Hamming Distance kernel
 // -----------------
 //
@@ -216,6 +274,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
       for (int r = 0; r < 4; ++r)
         min_fhd[tm][tn][r] = 2.0f;
 
+  // Load from full-size buffer (400 words per row) - for premasked
   auto load_chunk_A = [&](uint32_t *dst, const uint32_t *src, int block_start,
                           int chunk_word) {
     int num_words = BLOCK_M * K_CHUNK_WORDS;
@@ -233,26 +292,85 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
     }
   };
 
+  // Load from half-size mask buffer (200 words per row)
+  auto load_chunk_A_half = [&](uint32_t *dst, const uint32_t *src,
+                               int block_start, int chunk_word) {
+    int num_words = BLOCK_M * K_CHUNK_WORDS;
+    for (int idx4 = threadIdx.x; idx4 * 4 < num_words; idx4 += blockDim.x) {
+      int idx = idx4 * 4;
+      int r = idx / K_CHUNK_WORDS;
+      int w = idx % K_CHUNK_WORDS;
+      int g_row = block_start + r;
+      if (g_row < M) {
+        __pipeline_memcpy_async(
+            dst + idx, src + g_row * K_WORDS_HALF + chunk_word + w, 16);
+      } else {
+        dst[idx] = dst[idx + 1] = dst[idx + 2] = dst[idx + 3] = 0;
+      }
+    }
+  };
+
+  // D1-major layout: first 200 words = d1=0, last 200 words = d1=1
+  // Shift wraps independently within each half
+  // For premasked (400 words per row)
   auto load_chunk_B_ext = [&](uint32_t *dst, const uint32_t *src,
                               int block_start, int chunk_idx, int shift_words) {
     int chunk_word = chunk_idx * K_CHUNK_WORDS;
     int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
 
+    // Determine which half this chunk is in
+    int half = chunk_word / K_WORDS_HALF; // 0 for first half, 1 for second
+    int half_base = half * K_WORDS_HALF;  // 0 or 200
+    // Shift amount per half: shift_words is total for both halves, divide by 2
+    int half_shift = shift_words / 2;
+
     for (int idx = threadIdx.x; idx < num_elems; idx += blockDim.x) {
       int r = idx / K_CHUNK_WORDS_EXT;
       int w = idx % K_CHUNK_WORDS_EXT;
       int g_row = block_start + r;
-      int g_word = chunk_word + w - 1 + shift_words;
+      // Position within the half
+      int local_word = (chunk_word % K_WORDS_HALF) + w - 1 + half_shift;
 
       if (g_row < M) {
-        // Optimized wraparound: g_word is in [-31, 439] range
-        // Avoid expensive modulo by using conditional add/subtract
-        int gw = g_word;
-        if (gw < 0)
-          gw += K_WORDS;
-        else if (gw >= K_WORDS)
-          gw -= K_WORDS;
+        // Wraparound within the half (0-199 range)
+        int gw_local = local_word;
+        if (gw_local < 0)
+          gw_local += K_WORDS_HALF;
+        else if (gw_local >= K_WORDS_HALF)
+          gw_local -= K_WORDS_HALF;
+        int gw = half_base + gw_local;
         const uint32_t *src_ptr = src + g_row * K_WORDS + gw;
+        __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
+      } else {
+        dst[idx] = 0;
+      }
+    }
+  };
+
+  // Load from half-size mask buffer (200 words per row) with shift
+  // Half-mask only has d1=0 bits, so shift wraps within 200 words
+  auto load_chunk_B_ext_half = [&](uint32_t *dst, const uint32_t *src,
+                                   int block_start, int chunk_idx,
+                                   int shift_words) {
+    int chunk_word = chunk_idx * K_CHUNK_WORDS;
+    int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
+    // Shift for half mask: each theta = 1 word (not 2)
+    int half_shift = shift_words / 2;
+
+    for (int idx = threadIdx.x; idx < num_elems; idx += blockDim.x) {
+      int r = idx / K_CHUNK_WORDS_EXT;
+      int w = idx % K_CHUNK_WORDS_EXT;
+      int g_row = block_start + r;
+      int local_word = chunk_word + w - 1 + half_shift;
+
+      if (g_row < M) {
+        // Wraparound within 200 words
+        int gw = local_word;
+        if (gw < 0)
+          gw += K_WORDS_HALF;
+        else if (gw >= K_WORDS_HALF)
+          gw -= K_WORDS_HALF;
+        const uint32_t *src_ptr = src + g_row * K_WORDS_HALF + gw;
         __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
       } else {
         dst[idx] = 0;
@@ -279,19 +397,69 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
           c3_frag[tm][tn][r] = 0;
         }
 
+    // Half-mask optimization: mask is stored as 200 words (d1=0 only).
+    // Use load_chunk_A_half and load_chunk_B_ext_half for mask.
+
     int stage = 0;
     {
       load_chunk_A(A_pm_stage(stage), premasked, block_row_start, 0);
-      load_chunk_A(A_m_stage(stage), mask, block_row_start, 0);
+      load_chunk_A_half(A_m_stage(stage), mask, block_row_start, 0);
       load_chunk_B_ext(B_pm_stage(stage), premasked, block_col_start, 0,
                        shift_words);
-      load_chunk_B_ext(B_m_stage(stage), mask, block_col_start, 0, shift_words);
+      load_chunk_B_ext_half(B_m_stage(stage), mask, block_col_start, 0,
+                            shift_words);
       __pipeline_commit();
       __pipeline_wait_prior(0);
       __syncthreads();
     }
 
-    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+    // Shared inner MMA body is implemented via iris_accum_tiles<DO_C3>().
+
+    // Phase 1: Process chunks 0-24 with all 3 MMAs (c1, c2, c3)
+    for (int kc = 0; kc < K_CHUNKS_HALF; ++kc) {
+      uint32_t *A_pm_buf = A_pm_stage(stage);
+      uint32_t *A_m_buf = A_m_stage(stage);
+      uint32_t *B_pm_buf = B_pm_stage(stage);
+      uint32_t *B_m_buf = B_m_stage(stage);
+
+      int next_stage = stage ^ 1;
+      if (kc + 1 < K_CHUNKS_HALF) {
+        load_chunk_A(A_pm_stage(next_stage), premasked, block_row_start,
+                     (kc + 1) * K_CHUNK_WORDS);
+        load_chunk_A_half(A_m_stage(next_stage), mask, block_row_start,
+                          (kc + 1) * K_CHUNK_WORDS);
+        load_chunk_B_ext(B_pm_stage(next_stage), premasked, block_col_start,
+                         kc + 1, shift_words);
+        load_chunk_B_ext_half(B_m_stage(next_stage), mask, block_col_start,
+                              kc + 1, shift_words);
+        __pipeline_commit();
+      }
+      iris_accum_tiles<true>(A_pm_buf, A_m_buf, B_pm_buf, B_m_buf, tile_m_base,
+                             tile_n_base, c1_frag, c2_frag, c3_frag);
+
+      if (kc + 1 < K_CHUNKS_HALF)
+        __pipeline_wait_prior(0);
+      __syncthreads();
+      stage ^= 1;
+    }
+
+    // Transition: load first chunk of phase 2 (need mask for xp, but not for
+    // c3)
+    {
+      load_chunk_A(A_pm_stage(stage), premasked, block_row_start,
+                   K_CHUNKS_HALF * K_CHUNK_WORDS);
+      load_chunk_A_half(A_m_stage(stage), mask, block_row_start, 0);
+      load_chunk_B_ext(B_pm_stage(stage), premasked, block_col_start,
+                       K_CHUNKS_HALF, shift_words);
+      load_chunk_B_ext_half(B_m_stage(stage), mask, block_col_start, 0,
+                            shift_words);
+      __pipeline_commit();
+      __pipeline_wait_prior(0);
+      __syncthreads();
+    }
+
+    // Phase 2: Process chunks 25-49 with only 2 MMAs (c1, c2) - skip c3
+    for (int kc = K_CHUNKS_HALF; kc < K_CHUNKS; ++kc) {
       uint32_t *A_pm_buf = A_pm_stage(stage);
       uint32_t *A_m_buf = A_m_stage(stage);
       uint32_t *B_pm_buf = B_pm_stage(stage);
@@ -299,75 +467,35 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
 
       int next_stage = stage ^ 1;
       if (kc + 1 < K_CHUNKS) {
+        int next_mask_chunk = (kc + 1) % K_CHUNKS_HALF;
         load_chunk_A(A_pm_stage(next_stage), premasked, block_row_start,
                      (kc + 1) * K_CHUNK_WORDS);
-        load_chunk_A(A_m_stage(next_stage), mask, block_row_start,
-                     (kc + 1) * K_CHUNK_WORDS);
+        load_chunk_A_half(A_m_stage(next_stage), mask, block_row_start,
+                          next_mask_chunk * K_CHUNK_WORDS);
         load_chunk_B_ext(B_pm_stage(next_stage), premasked, block_col_start,
                          kc + 1, shift_words);
-        load_chunk_B_ext(B_m_stage(next_stage), mask, block_col_start, kc + 1,
-                         shift_words);
+        load_chunk_B_ext_half(B_m_stage(next_stage), mask, block_col_start,
+                              next_mask_chunk, shift_words);
         __pipeline_commit();
       }
-
-#pragma unroll
-      for (int tm = 0; tm < TILES_M_PER_WARP; ++tm) {
-        int row_off = (tile_m_base + tm) * WMMA_M * K_CHUNK_WORDS;
-        uint32_t *A_pm_tile = A_pm_buf + row_off;
-        uint32_t *A_m_tile = A_m_buf + row_off;
-
-        uint32_t a_pm0, a_pm1, a_pm2, a_pm3;
-        uint32_t a_m0, a_m1, a_m2, a_m3;
-        load_a_frag(A_pm_tile, a_pm0, a_pm1, a_pm2, a_pm3);
-        load_a_frag(A_m_tile, a_m0, a_m1, a_m2, a_m3);
-
-        uint32_t a_xp0 = a_m0 ^ a_pm0;
-        uint32_t a_xp1 = a_m1 ^ a_pm1;
-        uint32_t a_xp2 = a_m2 ^ a_pm2;
-        uint32_t a_xp3 = a_m3 ^ a_pm3;
-
-#pragma unroll
-        for (int tn = 0; tn < TILES_N_PER_WARP; ++tn) {
-          int col_off = (tile_n_base + tn) * WMMA_N * K_CHUNK_WORDS_EXT;
-          uint32_t *B_pm_tile = B_pm_buf + col_off;
-          uint32_t *B_m_tile = B_m_buf + col_off;
-
-          uint32_t b_pm0, b_pm1;
-          uint32_t b_m0, b_m1;
-          load_b_frag(B_pm_tile, b_pm0, b_pm1);
-          load_b_frag(B_m_tile, b_m0, b_m1);
-
-          uint32_t b_xp0 = b_m0 ^ b_pm0;
-          uint32_t b_xp1 = b_m1 ^ b_pm1;
-
-          mma_b1_and_popc_16x8x256(c1_frag[tm][tn][0], c1_frag[tm][tn][1],
-                                   c1_frag[tm][tn][2], c1_frag[tm][tn][3],
-                                   a_xp0, a_xp1, a_xp2, a_xp3, b_pm0, b_pm1);
-
-          mma_b1_and_popc_16x8x256(c2_frag[tm][tn][0], c2_frag[tm][tn][1],
-                                   c2_frag[tm][tn][2], c2_frag[tm][tn][3],
-                                   a_pm0, a_pm1, a_pm2, a_pm3, b_xp0, b_xp1);
-
-          mma_b1_and_popc_16x8x256(c3_frag[tm][tn][0], c3_frag[tm][tn][1],
-                                   c3_frag[tm][tn][2], c3_frag[tm][tn][3], a_m0,
-                                   a_m1, a_m2, a_m3, b_m0, b_m1);
-        }
-      }
+      iris_accum_tiles<false>(A_pm_buf, A_m_buf, B_pm_buf, B_m_buf, tile_m_base,
+                              tile_n_base, c1_frag, c2_frag, c3_frag);
 
       if (kc + 1 < K_CHUNKS)
         __pipeline_wait_prior(0);
       __syncthreads();
       stage ^= 1;
     }
-
+    // (no macro cleanup needed)
     // Update minimum FHD for this shift
+    // c3 was only computed for first 25 chunks (d1=0), multiply by 2
 #pragma unroll
     for (int tm = 0; tm < TILES_M_PER_WARP; ++tm)
 #pragma unroll
       for (int tn = 0; tn < TILES_N_PER_WARP; ++tn)
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-          int32_t c3 = c3_frag[tm][tn][r];
+          int32_t c3 = c3_frag[tm][tn][r] * 2; // Double for d1=1
           if (c3 > 0) {
             float fhd =
                 (float)(c1_frag[tm][tn][r] + c2_frag[tm][tn][r]) / (float)c3;
@@ -469,21 +597,30 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
 }
 
 // ----------------- Preprocessing kernel -----------------
+// Mask is stored as half-size (200 words per sample) since d1 bits are
+// duplicated. This kernel expands the mask when computing premasked.
 
 __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
                                   const uint32_t *__restrict__ mask,
                                   uint32_t *__restrict__ premasked, int M) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < M * K_WORDS) {
-    premasked[idx] = data[idx] & mask[idx];
+    int row = idx / K_WORDS;
+    int col = idx % K_WORDS;
+    // Mask is only K_WORDS_HALF per row, use col % K_WORDS_HALF to expand
+    int mask_col = col % K_WORDS_HALF;
+    premasked[idx] = data[idx] & mask[row * K_WORDS_HALF + mask_col];
   }
 }
 
-// ----------------- Pack theta-major kernel -----------------
+// ----------------- Pack d1-major kernel -----------------
 // Packs (M, 16, 200, 2, 2) uint8 bits into (M, 400) int32 words IN-PLACE.
 // Uses cooperative groups for grid-level sync to ensure all reads complete
 // before any writes. Input layout strides: r=800, theta=4, d0=2, d1=1
-// Output is theta-major: theta is fastest-varying in the packed bitstream.
+// Output is d1-major: d1 is slowest-varying, then theta, then r*2+d0.
+// This layout enables half-mask optimization since mask has duplicate d1 bits.
+// linear_bit = d1*6400 + theta*32 + r*2 + d0
+// First 200 words: d1=0 bits, Last 200 words: d1=1 bits
 
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
@@ -516,12 +653,15 @@ __global__ void pack_theta_major_kernel(uint8_t *data, int M) {
 
 #pragma unroll
     for (int b = 0; b < 32; b++) {
+      // D1-major layout: linear_bit = d1*6400 + theta*32 + r*2 + d0
       int linear_bit = w * 32 + b;
-      int theta = linear_bit / 64;
-      int inner = linear_bit % 64;
-      int r = inner / 4;
-      int d0 = (inner / 2) % 2;
-      int d1 = inner % 2;
+      int d1 = linear_bit / K_BITS_HALF; // 0 or 1
+      int within_half = linear_bit % K_BITS_HALF;
+      int theta = within_half / 32; // 0-199
+      int inner = within_half % 32;
+      int r = inner / 2;  // 0-15
+      int d0 = inner % 2; // 0-1
+      // Input layout: src_idx = r*800 + theta*4 + d0*2 + d1
       int src_idx = r * 800 + theta * 4 + d0 * 2 + d1;
 
       if (bits_smem[src_idx]) {
@@ -556,11 +696,70 @@ extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
                               dim3(threads), args, smem, stream);
 }
 
-// ----------------- Repack u32 from r-major to theta-major -----------------
+// ----------------- Pack half-mask kernel -----------------
+// Packs mask (M, 16, 200, 2, 2) uint8 bits into (M, 200) int32 words.
+// Only stores d1=0 bits since d1=1 is identical (duplicate d1 structure).
+// Output layout: linear_bit = theta*32 + r*2 + d0
+// NOT in-place: requires separate output buffer.
+
+__global__ void pack_half_mask_kernel(const uint8_t *__restrict__ input,
+                                      uint32_t *__restrict__ output, int M) {
+  int m = blockIdx.x;
+  if (m >= M)
+    return;
+
+  extern __shared__ uint32_t smem_raw[];
+  uint8_t *bits_smem = reinterpret_cast<uint8_t *>(smem_raw);
+
+  // Load row m from global memory into shared memory
+  const uint8_t *in_row = input + m * K_BITS;
+  for (int i = threadIdx.x; i < K_BITS; i += blockDim.x) {
+    bits_smem[i] = in_row[i];
+  }
+  __syncthreads();
+
+  // Pack only d1=0 bits into K_WORDS_HALF words
+  uint32_t *out_row = output + m * K_WORDS_HALF;
+  for (int w = threadIdx.x; w < K_WORDS_HALF; w += blockDim.x) {
+    uint32_t word = 0;
+
+#pragma unroll
+    for (int b = 0; b < 32; b++) {
+      // Half-mask layout: linear_bit = theta*32 + r*2 + d0 (d1=0 only)
+      int linear_bit = w * 32 + b;
+      int theta = linear_bit / 32; // 0-199
+      int inner = linear_bit % 32;
+      int r = inner / 2;  // 0-15
+      int d0 = inner % 2; // 0-1
+      int d1 = 0;         // Always d1=0 for half-mask
+      // Input layout: src_idx = r*800 + theta*4 + d0*2 + d1
+      int src_idx = r * 800 + theta * 4 + d0 * 2 + d1;
+
+      if (bits_smem[src_idx]) {
+        word |= (1u << b);
+      }
+    }
+    out_row[w] = word;
+  }
+}
+
+// C++/Python-facing launcher for half-mask packing kernel.
+// Packs M * 12800 bytes (uint8) into M * 200 int32 words.
+extern "C" void launch_pack_half_mask_cuda(const uint8_t *input,
+                                           uint32_t *output, int M,
+                                           cudaStream_t stream) {
+  int threads = 256;
+  size_t smem = ((K_BITS + 3) / 4) * 4; // 12800 bytes for input
+
+  pack_half_mask_kernel<<<M, threads, smem, stream>>>(input, output, M);
+}
+
+// ----------------- Repack u32 from r-major to d1-major -----------------
 // Input: (M, 400) int32 packed in r-major order: bit[r,theta,d0,d1] at
 //        linear_bit = r*800 + theta*4 + d0*2 + d1
-// Output: (M, 400) int32 packed in theta-major order: bit[r,theta,d0,d1] at
-//        linear_bit = theta*64 + r*4 + d0*2 + d1
+// Output: (M, 400) int32 packed in d1-major order: bit[r,theta,d0,d1] at
+//        linear_bit = d1*6400 + theta*32 + r*2 + d0
+// First 200 words: d1=0 bits, Last 200 words: d1=1 bits
 
 __global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
                                              uint32_t *__restrict__ output,
@@ -578,22 +777,24 @@ __global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
   }
   __syncthreads();
 
-  // Repack to theta-major
+  // Repack to d1-major
   uint32_t *out_row = output + m * K_WORDS;
   for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
     uint32_t word = 0;
 
 #pragma unroll
     for (int b = 0; b < 32; b++) {
-      // Output bit position (theta-major)
+      // Output bit position (d1-major): linear_bit = d1*6400 + theta*32 + r*2 +
+      // d0
       int dst_linear_bit = w * 32 + b;
-      int theta = dst_linear_bit / 64;
-      int inner = dst_linear_bit % 64;
-      int r = inner / 4;
-      int d0 = (inner / 2) % 2;
-      int d1 = inner % 2;
+      int d1 = dst_linear_bit / K_BITS_HALF;
+      int within_half = dst_linear_bit % K_BITS_HALF;
+      int theta = within_half / 32;
+      int inner = within_half % 32;
+      int r = inner / 2;
+      int d0 = inner % 2;
 
-      // Source bit position (r-major)
+      // Source bit position (r-major): linear_bit = r*800 + theta*4 + d0*2 + d1
       int src_linear_bit = r * 800 + theta * 4 + d0 * 2 + d1;
       int src_word = src_linear_bit / 32;
       int src_bit = src_linear_bit % 32;
@@ -708,7 +909,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       for (int r = 0; r < 4; ++r)
         min_fhd[tm][tn][r] = 2.0f;
 
-  // Lambda to load A chunks (from set A)
+  // Lambda to load A chunks from full-size buffer (400 words per row)
   auto load_chunk_A = [&](uint32_t *dst, const uint32_t *src, int block_start,
                           int chunk_word, int M_limit) {
     int num_words = BLOCK_M * K_CHUNK_WORDS;
@@ -726,27 +927,78 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
     }
   };
 
-  // Lambda to load B chunks with extended halo (from set B)
+  // Lambda to load A chunks from half-size mask buffer (200 words per row)
+  auto load_chunk_A_half = [&](uint32_t *dst, const uint32_t *src,
+                               int block_start, int chunk_word, int M_limit) {
+    int num_words = BLOCK_M * K_CHUNK_WORDS;
+    for (int idx4 = threadIdx.x; idx4 * 4 < num_words; idx4 += blockDim.x) {
+      int idx = idx4 * 4;
+      int r = idx / K_CHUNK_WORDS;
+      int w = idx % K_CHUNK_WORDS;
+      int g_row = block_start + r;
+      if (g_row < M_limit) {
+        __pipeline_memcpy_async(
+            dst + idx, src + g_row * K_WORDS_HALF + chunk_word + w, 16);
+      } else {
+        dst[idx] = dst[idx + 1] = dst[idx + 2] = dst[idx + 3] = 0;
+      }
+    }
+  };
+
+  // Lambda to load B chunks from full-size buffer (400 words per row)
+  // D1-major layout: first 200 words = d1=0, last 200 words = d1=1
   auto load_chunk_B_ext = [&](uint32_t *dst, const uint32_t *src,
                               int block_start, int chunk_idx, int shift_words,
                               int M_limit) {
     int chunk_word = chunk_idx * K_CHUNK_WORDS;
     int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
 
+    int half = chunk_word / K_WORDS_HALF;
+    int half_base = half * K_WORDS_HALF;
+    int half_shift = shift_words / 2;
+
     for (int idx = threadIdx.x; idx < num_elems; idx += blockDim.x) {
       int r = idx / K_CHUNK_WORDS_EXT;
       int w = idx % K_CHUNK_WORDS_EXT;
       int g_row = block_start + r;
-      int g_word = chunk_word + w - 1 + shift_words;
+      int local_word = (chunk_word % K_WORDS_HALF) + w - 1 + half_shift;
 
       if (g_row < M_limit) {
-        // Optimized wraparound: avoid expensive modulo
-        int gw = g_word;
-        if (gw < 0)
-          gw += K_WORDS;
-        else if (gw >= K_WORDS)
-          gw -= K_WORDS;
+        int gw_local = local_word;
+        if (gw_local < 0)
+          gw_local += K_WORDS_HALF;
+        else if (gw_local >= K_WORDS_HALF)
+          gw_local -= K_WORDS_HALF;
+        int gw = half_base + gw_local;
         const uint32_t *src_ptr = src + g_row * K_WORDS + gw;
+        __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
+      } else {
+        dst[idx] = 0;
+      }
+    }
+  };
+
+  // Lambda to load B chunks from half-size mask buffer (200 words per row)
+  auto load_chunk_B_ext_half = [&](uint32_t *dst, const uint32_t *src,
+                                   int block_start, int chunk_idx,
+                                   int shift_words, int M_limit) {
+    int chunk_word = chunk_idx * K_CHUNK_WORDS;
+    int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
+    int half_shift = shift_words / 2;
+
+    for (int idx = threadIdx.x; idx < num_elems; idx += blockDim.x) {
+      int r = idx / K_CHUNK_WORDS_EXT;
+      int w = idx % K_CHUNK_WORDS_EXT;
+      int g_row = block_start + r;
+      int local_word = chunk_word + w - 1 + half_shift;
+
+      if (g_row < M_limit) {
+        int gw = local_word;
+        if (gw < 0)
+          gw += K_WORDS_HALF;
+        else if (gw >= K_WORDS_HALF)
+          gw -= K_WORDS_HALF;
+        const uint32_t *src_ptr = src + g_row * K_WORDS_HALF + gw;
         __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
       } else {
         dst[idx] = 0;
@@ -772,20 +1024,67 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
           c3_frag[tm][tn][r] = 0;
         }
 
+    // Half-mask optimization: two-phase loop to skip c3 MMA in second half
+
     int stage = 0;
     {
       load_chunk_A(A_pm_stage(stage), premasked_A, block_row_start, 0, M_A);
-      load_chunk_A(A_m_stage(stage), mask_A, block_row_start, 0, M_A);
+      load_chunk_A_half(A_m_stage(stage), mask_A, block_row_start, 0, M_A);
       load_chunk_B_ext(B_pm_stage(stage), premasked_B, block_col_start, 0,
                        shift_words, M_B);
-      load_chunk_B_ext(B_m_stage(stage), mask_B, block_col_start, 0,
-                       shift_words, M_B);
+      load_chunk_B_ext_half(B_m_stage(stage), mask_B, block_col_start, 0,
+                            shift_words, M_B);
       __pipeline_commit();
       __pipeline_wait_prior(0);
       __syncthreads();
     }
 
-    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+    // Shared inner MMA body is implemented via iris_accum_tiles<DO_C3>().
+
+    // Phase 1: chunks 0-24 with all 3 MMAs
+    for (int kc = 0; kc < K_CHUNKS_HALF; ++kc) {
+      uint32_t *A_pm_buf = A_pm_stage(stage);
+      uint32_t *A_m_buf = A_m_stage(stage);
+      uint32_t *B_pm_buf = B_pm_stage(stage);
+      uint32_t *B_m_buf = B_m_stage(stage);
+
+      int next_stage = stage ^ 1;
+      if (kc + 1 < K_CHUNKS_HALF) {
+        load_chunk_A(A_pm_stage(next_stage), premasked_A, block_row_start,
+                     (kc + 1) * K_CHUNK_WORDS, M_A);
+        load_chunk_A_half(A_m_stage(next_stage), mask_A, block_row_start,
+                          (kc + 1) * K_CHUNK_WORDS, M_A);
+        load_chunk_B_ext(B_pm_stage(next_stage), premasked_B, block_col_start,
+                         kc + 1, shift_words, M_B);
+        load_chunk_B_ext_half(B_m_stage(next_stage), mask_B, block_col_start,
+                              kc + 1, shift_words, M_B);
+        __pipeline_commit();
+      }
+      iris_accum_tiles<true>(A_pm_buf, A_m_buf, B_pm_buf, B_m_buf, tile_m_base,
+                             tile_n_base, c1_frag, c2_frag, c3_frag);
+
+      if (kc + 1 < K_CHUNKS_HALF)
+        __pipeline_wait_prior(0);
+      __syncthreads();
+      stage ^= 1;
+    }
+
+    // Transition: load first chunk of phase 2
+    {
+      load_chunk_A(A_pm_stage(stage), premasked_A, block_row_start,
+                   K_CHUNKS_HALF * K_CHUNK_WORDS, M_A);
+      load_chunk_A_half(A_m_stage(stage), mask_A, block_row_start, 0, M_A);
+      load_chunk_B_ext(B_pm_stage(stage), premasked_B, block_col_start,
+                       K_CHUNKS_HALF, shift_words, M_B);
+      load_chunk_B_ext_half(B_m_stage(stage), mask_B, block_col_start, 0,
+                            shift_words, M_B);
+      __pipeline_commit();
+      __pipeline_wait_prior(0);
+      __syncthreads();
+    }
+
+    // Phase 2: chunks 25-49 with only 2 MMAs (skip c3)
+    for (int kc = K_CHUNKS_HALF; kc < K_CHUNKS; ++kc) {
       uint32_t *A_pm_buf = A_pm_stage(stage);
       uint32_t *A_m_buf = A_m_stage(stage);
       uint32_t *B_pm_buf = B_pm_stage(stage);
@@ -793,75 +1092,35 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
 
       int next_stage = stage ^ 1;
       if (kc + 1 < K_CHUNKS) {
+        int next_mask_chunk = (kc + 1) % K_CHUNKS_HALF;
         load_chunk_A(A_pm_stage(next_stage), premasked_A, block_row_start,
                      (kc + 1) * K_CHUNK_WORDS, M_A);
-        load_chunk_A(A_m_stage(next_stage), mask_A, block_row_start,
-                     (kc + 1) * K_CHUNK_WORDS, M_A);
+        load_chunk_A_half(A_m_stage(next_stage), mask_A, block_row_start,
+                          next_mask_chunk * K_CHUNK_WORDS, M_A);
         load_chunk_B_ext(B_pm_stage(next_stage), premasked_B, block_col_start,
                          kc + 1, shift_words, M_B);
-        load_chunk_B_ext(B_m_stage(next_stage), mask_B, block_col_start, kc + 1,
-                         shift_words, M_B);
+        load_chunk_B_ext_half(B_m_stage(next_stage), mask_B, block_col_start,
+                              next_mask_chunk, shift_words, M_B);
         __pipeline_commit();
       }
-
-#pragma unroll
-      for (int tm = 0; tm < TILES_M_PER_WARP; ++tm) {
-        int row_off = (tile_m_base + tm) * WMMA_M * K_CHUNK_WORDS;
-        uint32_t *A_pm_tile = A_pm_buf + row_off;
-        uint32_t *A_m_tile = A_m_buf + row_off;
-
-        uint32_t a_pm0, a_pm1, a_pm2, a_pm3;
-        uint32_t a_m0, a_m1, a_m2, a_m3;
-        load_a_frag(A_pm_tile, a_pm0, a_pm1, a_pm2, a_pm3);
-        load_a_frag(A_m_tile, a_m0, a_m1, a_m2, a_m3);
-
-        uint32_t a_xp0 = a_m0 ^ a_pm0;
-        uint32_t a_xp1 = a_m1 ^ a_pm1;
-        uint32_t a_xp2 = a_m2 ^ a_pm2;
-        uint32_t a_xp3 = a_m3 ^ a_pm3;
-
-#pragma unroll
-        for (int tn = 0; tn < TILES_N_PER_WARP; ++tn) {
-          int col_off = (tile_n_base + tn) * WMMA_N * K_CHUNK_WORDS_EXT;
-          uint32_t *B_pm_tile = B_pm_buf + col_off;
-          uint32_t *B_m_tile = B_m_buf + col_off;
-
-          uint32_t b_pm0, b_pm1;
-          uint32_t b_m0, b_m1;
-          load_b_frag(B_pm_tile, b_pm0, b_pm1);
-          load_b_frag(B_m_tile, b_m0, b_m1);
-
-          uint32_t b_xp0 = b_m0 ^ b_pm0;
-          uint32_t b_xp1 = b_m1 ^ b_pm1;
-
-          mma_b1_and_popc_16x8x256(c1_frag[tm][tn][0], c1_frag[tm][tn][1],
-                                   c1_frag[tm][tn][2], c1_frag[tm][tn][3],
-                                   a_xp0, a_xp1, a_xp2, a_xp3, b_pm0, b_pm1);
-
-          mma_b1_and_popc_16x8x256(c2_frag[tm][tn][0], c2_frag[tm][tn][1],
-                                   c2_frag[tm][tn][2], c2_frag[tm][tn][3],
-                                   a_pm0, a_pm1, a_pm2, a_pm3, b_xp0, b_xp1);
-
-          mma_b1_and_popc_16x8x256(c3_frag[tm][tn][0], c3_frag[tm][tn][1],
-                                   c3_frag[tm][tn][2], c3_frag[tm][tn][3], a_m0,
-                                   a_m1, a_m2, a_m3, b_m0, b_m1);
-        }
-      }
+      iris_accum_tiles<false>(A_pm_buf, A_m_buf, B_pm_buf, B_m_buf, tile_m_base,
+                              tile_n_base, c1_frag, c2_frag, c3_frag);
 
       if (kc + 1 < K_CHUNKS)
         __pipeline_wait_prior(0);
       __syncthreads();
       stage ^= 1;
     }
-
+    // (no macro cleanup needed)
     // Update minimum FHD for this shift
+    // c3 only computed for first 25 chunks, multiply by 2
 #pragma unroll
     for (int tm = 0; tm < TILES_M_PER_WARP; ++tm)
 #pragma unroll
       for (int tn = 0; tn < TILES_N_PER_WARP; ++tn)
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-          int32_t c3 = c3_frag[tm][tn][r];
+          int32_t c3 = c3_frag[tm][tn][r] * 2;
           if (c3 > 0) {
             float fhd =
                 (float)(c1_frag[tm][tn][r] + c2_frag[tm][tn][r]) / (float)c3;

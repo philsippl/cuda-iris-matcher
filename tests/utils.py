@@ -165,6 +165,9 @@ def generate_similar_iris_code(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate an iris code similar to a base code (for same subject/eye simulations).
 
+    The mask maintains duplicate d1 bits (mask[:,:,:,0] == mask[:,:,:,1]) to match
+    the real-world iris code structure.
+
     Args:
         base_code: Base iris code, shape (16, 200, 2, 2), dtype uint8.
         base_mask: Base mask, shape (16, 200, 2, 2), dtype uint8.
@@ -172,26 +175,31 @@ def generate_similar_iris_code(
         seed: Random seed for reproducibility.
 
     Returns:
-        Tuple (new_code, new_mask) with similar patterns.
+        Tuple (new_code, new_mask) with similar patterns. Mask has duplicate d1 bits.
     """
     rng = np.random.RandomState(seed)
 
     # Copy base code and add noise
     new_code = base_code.copy()
-    new_mask = base_mask.copy()
 
-    # Flip a small fraction of bits
+    # Flip a small fraction of code bits (code has independent d1 values)
     n_bits = base_code.size
     n_flip = int(n_bits * noise_ratio)
     flip_indices = rng.choice(n_bits, size=n_flip, replace=False)
     flat_code = new_code.ravel()
     flat_code[flip_indices] = 1 - flat_code[flip_indices]
 
-    # Slightly modify mask (fewer changes to keep valid region similar)
-    n_mask_flip = int(n_bits * noise_ratio * 0.1)
-    mask_flip_indices = rng.choice(n_bits, size=n_mask_flip, replace=False)
-    flat_mask = new_mask.ravel()
-    flat_mask[mask_flip_indices] = 1 - flat_mask[mask_flip_indices]
+    # Slightly modify mask - but maintain duplicate d1 structure
+    # Work with the half mask (d1=0 slice) and then duplicate
+    half_mask = base_mask[:, :, :, 0].copy()  # Shape (16, 200, 2)
+    n_half_bits = half_mask.size
+    n_mask_flip = int(n_half_bits * noise_ratio * 0.1)
+    mask_flip_indices = rng.choice(n_half_bits, size=n_mask_flip, replace=False)
+    flat_half_mask = half_mask.ravel()
+    flat_half_mask[mask_flip_indices] = 1 - flat_half_mask[mask_flip_indices]
+
+    # Reconstruct full mask with duplicate d1 bits
+    new_mask = np.stack([half_mask, half_mask], axis=-1)
 
     return new_code, new_mask
 
@@ -199,14 +207,22 @@ def generate_similar_iris_code(
 def generate_random_iris_code(seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Generate a random iris code and mask.
 
+    The mask has duplicate d1 bits (mask[:,:,:,0] == mask[:,:,:,1]) to match
+    the real-world iris code structure where the mask is the same for both
+    real and imaginary components of the filter response.
+
     Args:
         seed: Random seed for reproducibility.
 
     Returns:
         Tuple (code, mask) with shape (16, 200, 2, 2), dtype uint8.
+        Code has independent d1 bits, mask has duplicate d1 bits.
     """
     rng = np.random.RandomState(seed)
+    # Code has independent values for d1=0 and d1=1 (real/imaginary parts)
     code = rng.randint(0, 2, (16, 200, 2, 2), dtype=np.uint8)
-    # Mask with ~80% valid bits
-    mask = (rng.random((16, 200, 2, 2)) < 0.8).astype(np.uint8)
+    # Mask with ~80% valid bits - same for both d1 values (real-world structure)
+    # Generate half mask for d1=0, then duplicate to d1=1
+    half_mask = (rng.random((16, 200, 2)) < 0.8).astype(np.uint8)
+    mask = np.stack([half_mask, half_mask], axis=-1)
     return code, mask

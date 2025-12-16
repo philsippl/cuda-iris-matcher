@@ -17,13 +17,15 @@ def test_matches_numpy_roll():
 
     M = 16
     code = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
-    mask = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
+    # Mask must have duplicate d1 bits (d1=0 == d1=1) for half-mask optimization
+    half_mask = np.random.randint(0, 2, (M, 16, 200, 2), dtype=np.uint8)
+    mask = np.stack([half_mask, half_mask], axis=-1)
 
     # Pack on GPU using CUDA kernel
     code_cuda = torch.from_numpy(code).cuda()
     mask_cuda = torch.from_numpy(mask).cuda()
     data_t = ih.pack_theta_major(code_cuda)
-    mask_t = ih.pack_theta_major(mask_cuda)
+    mask_t = ih.pack_half_mask(mask_cuda)
 
     # New interface: returns (pair_indices, categories, distances, count)
     # Use high threshold and INCLUDE_ALL to get all pairs
@@ -73,19 +75,19 @@ def test_repack_to_theta_major():
                             bit = linear_bit % 32
                             packed_r_major[m, word] |= np.uint32(1 << bit)
 
-    # Pack to theta-major order (NumPy reference)
-    # theta-major: bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
-    packed_theta_major_ref = np.zeros((M, 400), dtype=np.uint32)
+    # Pack to d1-major order (NumPy reference)
+    # d1-major: bit[r,theta,d0,d1] at linear_bit = d1*6400 + theta*32 + r*2 + d0
+    packed_d1_major_ref = np.zeros((M, 400), dtype=np.uint32)
     for m in range(M):
         for r in range(16):
             for theta in range(200):
                 for d0 in range(2):
                     for d1 in range(2):
                         if code[m, r, theta, d0, d1]:
-                            linear_bit = theta * 64 + r * 4 + d0 * 2 + d1
+                            linear_bit = d1 * 6400 + theta * 32 + r * 2 + d0
                             word = linear_bit // 32
                             bit = linear_bit % 32
-                            packed_theta_major_ref[m, word] |= np.uint32(1 << bit)
+                            packed_d1_major_ref[m, word] |= np.uint32(1 << bit)
 
     # Use CUDA repack function
     input_cuda = torch.from_numpy(packed_r_major.view(np.int32)).cuda()
@@ -94,7 +96,7 @@ def test_repack_to_theta_major():
 
     # Compare
     output_np = output_cuda.cpu().numpy().view(np.uint32)
-    assert np.array_equal(output_np, packed_theta_major_ref)
+    assert np.array_equal(output_np, packed_d1_major_ref)
 
 
 def test_masked_hamming_ab_matches_numpy():
@@ -105,9 +107,12 @@ def test_masked_hamming_ab_matches_numpy():
     M_A = 12
     M_B = 10
     code_a = np.random.randint(0, 2, (M_A, 16, 200, 2, 2), dtype=np.uint8)
-    mask_a = np.random.randint(0, 2, (M_A, 16, 200, 2, 2), dtype=np.uint8)
     code_b = np.random.randint(0, 2, (M_B, 16, 200, 2, 2), dtype=np.uint8)
-    mask_b = np.random.randint(0, 2, (M_B, 16, 200, 2, 2), dtype=np.uint8)
+    # Mask must have duplicate d1 bits for half-mask optimization
+    half_mask_a = np.random.randint(0, 2, (M_A, 16, 200, 2), dtype=np.uint8)
+    mask_a = np.stack([half_mask_a, half_mask_a], axis=-1)
+    half_mask_b = np.random.randint(0, 2, (M_B, 16, 200, 2), dtype=np.uint8)
+    mask_b = np.stack([half_mask_b, half_mask_b], axis=-1)
 
     # Pack on GPU using CUDA kernel
     code_a_cuda = torch.from_numpy(code_a).cuda()
@@ -116,9 +121,9 @@ def test_masked_hamming_ab_matches_numpy():
     mask_b_cuda = torch.from_numpy(mask_b).cuda()
 
     data_a_t = ih.pack_theta_major(code_a_cuda)
-    mask_a_t = ih.pack_theta_major(mask_a_cuda)
+    mask_a_t = ih.pack_half_mask(mask_a_cuda)
     data_b_t = ih.pack_theta_major(code_b_cuda)
-    mask_b_t = ih.pack_theta_major(mask_b_cuda)
+    mask_b_t = ih.pack_half_mask(mask_b_cuda)
 
     # New interface: returns (pair_indices, categories, distances, count)
     max_pairs = M_A * M_B
@@ -155,9 +160,12 @@ def test_masked_hamming_ab_pair_collection():
     M_B = 6
 
     code_a = np.random.randint(0, 2, (M_A, 16, 200, 2, 2), dtype=np.uint8)
-    mask_a = np.random.randint(0, 2, (M_A, 16, 200, 2, 2), dtype=np.uint8)
     code_b = np.random.randint(0, 2, (M_B, 16, 200, 2, 2), dtype=np.uint8)
-    mask_b = np.random.randint(0, 2, (M_B, 16, 200, 2, 2), dtype=np.uint8)
+    # Mask must have duplicate d1 bits for half-mask optimization
+    half_mask_a = np.random.randint(0, 2, (M_A, 16, 200, 2), dtype=np.uint8)
+    mask_a = np.stack([half_mask_a, half_mask_a], axis=-1)
+    half_mask_b = np.random.randint(0, 2, (M_B, 16, 200, 2), dtype=np.uint8)
+    mask_b = np.stack([half_mask_b, half_mask_b], axis=-1)
 
     # Pack on GPU
     code_a_cuda = torch.from_numpy(code_a).cuda()
@@ -166,9 +174,9 @@ def test_masked_hamming_ab_pair_collection():
     mask_b_cuda = torch.from_numpy(mask_b).cuda()
 
     data_a_t = ih.pack_theta_major(code_a_cuda)
-    mask_a_t = ih.pack_theta_major(mask_a_cuda)
+    mask_a_t = ih.pack_half_mask(mask_a_cuda)
     data_b_t = ih.pack_theta_major(code_b_cuda)
-    mask_b_t = ih.pack_theta_major(mask_b_cuda)
+    mask_b_t = ih.pack_half_mask(mask_b_cuda)
 
     threshold = 0.4
     max_pairs = 1000
@@ -224,9 +232,9 @@ def test_masked_hamming_ab_asymmetric_sizes():
     mask_b_cuda = torch.from_numpy(mask_b).cuda()
 
     data_a_t = ih.pack_theta_major(code_a_cuda)
-    mask_a_t = ih.pack_theta_major(mask_a_cuda)
+    mask_a_t = ih.pack_half_mask(mask_a_cuda)
     data_b_t = ih.pack_theta_major(code_b_cuda)
-    mask_b_t = ih.pack_theta_major(mask_b_cuda)
+    mask_b_t = ih.pack_half_mask(mask_b_cuda)
 
     # New interface
     max_pairs = M_A * M_B

@@ -119,7 +119,7 @@ def masked_hamming_ab_cuda(
 
 def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
     """
-    Pack iris code bits into theta-major int32 words using CUDA.
+    Pack iris code bits into d1-major int32 words using CUDA.
 
     Args:
         bits: CUDA uint8 tensor of shape (M, 16, 200, 2, 2) with values in {0, 1}.
@@ -128,20 +128,38 @@ def pack_theta_major_cuda(bits: torch.Tensor) -> torch.Tensor:
     Returns:
         Packed int32 tensor of shape (M, 400). Shares storage with input
         (no additional memory allocation).
+        Layout: linear_bit = d1*6400 + theta*32 + r*2 + d0
     """
     return _C.pack_theta_major_cuda(bits)
 
 
+def pack_half_mask_cuda(bits: torch.Tensor) -> torch.Tensor:
+    """
+    Pack mask bits into half-size int32 words using CUDA.
+
+    Only stores d1=0 bits since masks have duplicate d1 bits (d1=0 == d1=1).
+    This reduces mask memory by 50%.
+
+    Args:
+        bits: CUDA uint8 tensor of shape (M, 16, 200, 2, 2) with values in {0, 1}.
+
+    Returns:
+        Packed int32 tensor of shape (M, 200).
+        Layout: linear_bit = theta*32 + r*2 + d0
+    """
+    return _C.pack_half_mask_cuda(bits)
+
+
 def repack_to_theta_major_cuda(input: torch.Tensor) -> torch.Tensor:
     """
-    Repack int32 words from r-major to theta-major order using CUDA.
+    Repack int32 words from r-major to d1-major order using CUDA.
 
     Args:
         input: CUDA int32 tensor of shape (M, 400) packed in r-major order.
                Original layout: bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
 
     Returns:
-        New CUDA int32 tensor of shape (M, 400) packed in theta-major order.
-        Output layout: bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+        New CUDA int32 tensor of shape (M, 400) packed in d1-major order.
+        Output layout: bit[r,theta,d0,d1] at linear_bit = d1*6400 + theta*32 + r*2 + d0
     """
     return _C.repack_to_theta_major_cuda(input)

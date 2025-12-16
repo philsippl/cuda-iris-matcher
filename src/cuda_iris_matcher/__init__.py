@@ -2,6 +2,7 @@ from .ops import (
     masked_hamming_cuda,
     masked_hamming_ab_cuda,
     pack_theta_major_cuda as pack_theta_major,
+    pack_half_mask_cuda as pack_half_mask,
     repack_to_theta_major_cuda as repack_to_theta_major,
     # Classification constants
     CATEGORY_TRUE_MATCH,
@@ -19,6 +20,7 @@ __all__ = [
     "masked_hamming_cuda",
     "masked_hamming_ab_cuda",
     "pack_theta_major",
+    "pack_half_mask",
     "repack_to_theta_major",
     # Classification constants
     "CATEGORY_TRUE_MATCH",

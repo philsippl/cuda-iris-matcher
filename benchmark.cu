@@ -65,6 +65,17 @@ void fill_random(uint32_t *ptr, size_t count) {
   }
 }
 
+// Fill half-mask (200 words per row) with random data.
+// Half-mask only stores d1=0 bits since d1=1 is identical.
+void fill_random_half_mask(uint32_t *ptr, int M) {
+  for (int m = 0; m < M; m++) {
+    uint32_t *row = ptr + m * K_WORDS_HALF;
+    for (int w = 0; w < K_WORDS_HALF; w++) {
+      row[w] = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+    }
+  }
+}
+
 void print_gpu_info() {
   int device;
   cudaDeviceProp prop;
@@ -141,13 +152,15 @@ int main(int argc, char **argv) {
 
   // Allocate host memory
   size_t data_size = (size_t)M * K_WORDS * sizeof(uint32_t);
+  size_t mask_size = (size_t)M * K_WORDS_HALF * sizeof(uint32_t); // Half-mask
   uint32_t *h_data = (uint32_t *)malloc(data_size);
-  uint32_t *h_mask = (uint32_t *)malloc(data_size);
+  uint32_t *h_mask = (uint32_t *)malloc(mask_size);
 
   printf("Generating random data... ");
   fflush(stdout);
   fill_random(h_data, M * K_WORDS);
-  fill_random(h_mask, M * K_WORDS);
+  // Use half-mask (200 words per row) - real-world structure
+  fill_random_half_mask(h_mask, M);
   printf("done\n");
 
   // Allocate device memory
@@ -160,7 +173,7 @@ int main(int argc, char **argv) {
   unsigned int max_pairs = 1000000;
 
   CHECK_CUDA(cudaMalloc(&d_data, data_size));
-  CHECK_CUDA(cudaMalloc(&d_mask, data_size));
+  CHECK_CUDA(cudaMalloc(&d_mask, mask_size)); // Half-mask
   CHECK_CUDA(cudaMalloc(&d_premasked, data_size));
   CHECK_CUDA(cudaMalloc(&d_pair_indices, max_pairs * 2 * sizeof(int32_t)));
   CHECK_CUDA(cudaMalloc(&d_categories, max_pairs * sizeof(uint8_t)));
@@ -170,7 +183,7 @@ int main(int argc, char **argv) {
   printf("Copying data to GPU... ");
   fflush(stdout);
   CHECK_CUDA(cudaMemcpy(d_data, h_data, data_size, cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_mask, h_mask, data_size, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_mask, h_mask, mask_size, cudaMemcpyHostToDevice));
   printf("done\n\n");
 
   // Create events for timing
@@ -276,28 +289,30 @@ int main(int argc, char **argv) {
   // for B)
   size_t data_size_A = (size_t)M_A * K_WORDS * sizeof(uint32_t);
   size_t data_size_B = (size_t)M_B * K_WORDS * sizeof(uint32_t);
+  size_t mask_size_A = (size_t)M_A * K_WORDS_HALF * sizeof(uint32_t);
+  size_t mask_size_B = (size_t)M_B * K_WORDS_HALF * sizeof(uint32_t);
 
   uint32_t *h_data_B = (uint32_t *)malloc(data_size_B);
-  uint32_t *h_mask_B = (uint32_t *)malloc(data_size_B);
+  uint32_t *h_mask_B = (uint32_t *)malloc(mask_size_B);
   fill_random(h_data_B, M_B * K_WORDS);
-  fill_random(h_mask_B, M_B * K_WORDS);
+  fill_random_half_mask(h_mask_B, M_B);
 
   uint32_t *d_data_A, *d_mask_A, *d_premasked_A;
   uint32_t *d_data_B, *d_mask_B, *d_premasked_B;
 
   CHECK_CUDA(cudaMalloc(&d_data_A, data_size_A));
-  CHECK_CUDA(cudaMalloc(&d_mask_A, data_size_A));
+  CHECK_CUDA(cudaMalloc(&d_mask_A, mask_size_A));
   CHECK_CUDA(cudaMalloc(&d_premasked_A, data_size_A));
   CHECK_CUDA(cudaMalloc(&d_data_B, data_size_B));
-  CHECK_CUDA(cudaMalloc(&d_mask_B, data_size_B));
+  CHECK_CUDA(cudaMalloc(&d_mask_B, mask_size_B));
   CHECK_CUDA(cudaMalloc(&d_premasked_B, data_size_B));
 
   CHECK_CUDA(cudaMemcpy(d_data_A, h_data, data_size_A, cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_mask_A, h_mask, data_size_A, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_mask_A, h_mask, mask_size_A, cudaMemcpyHostToDevice));
   CHECK_CUDA(
       cudaMemcpy(d_data_B, h_data_B, data_size_B, cudaMemcpyHostToDevice));
   CHECK_CUDA(
-      cudaMemcpy(d_mask_B, h_mask_B, data_size_B, cudaMemcpyHostToDevice));
+      cudaMemcpy(d_mask_B, h_mask_B, mask_size_B, cudaMemcpyHostToDevice));
 
   // Warmup A vs B
   printf("Warmup (%d iterations)... ", warmup_iters);

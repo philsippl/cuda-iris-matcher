@@ -118,11 +118,11 @@ class TestLabelingSystem:
         self.M = len(self.codes)
         assert self.M == 10, f"Expected 10 iris codes, got {self.M}"
 
-        # Pack for CUDA
+        # Pack for CUDA - use pack_half_mask for masks (200 words instead of 400)
         code_cuda = torch.from_numpy(self.codes).cuda()
         mask_cuda = torch.from_numpy(self.masks).cuda()
         self.data_t = ih.pack_theta_major(code_cuda)
-        self.mask_t = ih.pack_theta_major(mask_cuda)
+        self.mask_t = ih.pack_half_mask(mask_cuda)
         self.labels_t = torch.from_numpy(self.labels).cuda()
 
     def test_same_subject_low_distance_reference(self):
@@ -683,9 +683,9 @@ class TestLabelingAB:
         mask_b_cuda = torch.from_numpy(self.masks_probe).cuda()
 
         self.data_a = ih.pack_theta_major(code_a_cuda)
-        self.mask_a = ih.pack_theta_major(mask_a_cuda)
+        self.mask_a = ih.pack_half_mask(mask_a_cuda)
         self.data_b = ih.pack_theta_major(code_b_cuda)
-        self.mask_b = ih.pack_theta_major(mask_b_cuda)
+        self.mask_b = ih.pack_half_mask(mask_b_cuda)
 
         self.labels_a = torch.from_numpy(self.labels_gallery).cuda()
         self.labels_b = torch.from_numpy(self.labels_probe).cuda()

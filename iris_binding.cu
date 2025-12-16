@@ -31,6 +31,10 @@ extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   uint32_t *output, int M,
                                                   cudaStream_t stream);
 
+extern "C" void launch_pack_half_mask_cuda(const uint8_t *input,
+                                           uint32_t *output, int M,
+                                           cudaStream_t stream);
+
 std::vector<torch::Tensor>
 masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
                     std::optional<torch::Tensor> labels,
@@ -43,9 +47,11 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   TORCH_CHECK(mask.scalar_type() == at::kInt, "mask dtype must be int32");
   TORCH_CHECK(data.is_contiguous() && mask.is_contiguous(),
               "data/mask must be contiguous");
-  TORCH_CHECK(data.sizes() == mask.sizes(), "data/mask shape mismatch");
   TORCH_CHECK(data.dim() == 2 && data.size(1) == K_WORDS,
               "expected data shape [M, ", K_WORDS, "]");
+  TORCH_CHECK(mask.dim() == 2 && mask.size(1) == K_WORDS_HALF,
+              "expected mask shape [M, ", K_WORDS_HALF, "] (half-mask)");
+  TORCH_CHECK(data.size(0) == mask.size(0), "data/mask row count mismatch");
 
   int64_t M = data.size(0);
   auto opts_int = data.options();
@@ -152,12 +158,16 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
               "data_a/mask_a must be contiguous");
   TORCH_CHECK(data_b.is_contiguous() && mask_b.is_contiguous(),
               "data_b/mask_b must be contiguous");
-  TORCH_CHECK(data_a.sizes() == mask_a.sizes(), "data_a/mask_a shape mismatch");
-  TORCH_CHECK(data_b.sizes() == mask_b.sizes(), "data_b/mask_b shape mismatch");
   TORCH_CHECK(data_a.dim() == 2 && data_a.size(1) == K_WORDS,
               "expected data_a shape [M_A, ", K_WORDS, "]");
   TORCH_CHECK(data_b.dim() == 2 && data_b.size(1) == K_WORDS,
               "expected data_b shape [M_B, ", K_WORDS, "]");
+  TORCH_CHECK(mask_a.dim() == 2 && mask_a.size(1) == K_WORDS_HALF,
+              "expected mask_a shape [M_A, ", K_WORDS_HALF, "] (half-mask)");
+  TORCH_CHECK(mask_b.dim() == 2 && mask_b.size(1) == K_WORDS_HALF,
+              "expected mask_b shape [M_B, ", K_WORDS_HALF, "] (half-mask)");
+  TORCH_CHECK(data_a.size(0) == mask_a.size(0), "data_a/mask_a row count mismatch");
+  TORCH_CHECK(data_b.size(0) == mask_b.size(0), "data_b/mask_b row count mismatch");
 
   int64_t M_A = data_a.size(0);
   int64_t M_B = data_b.size(0);
@@ -262,7 +272,11 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
 
 torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
   // Input: (M, 16, 200, 2, 2) uint8 tensor with values in {0, 1}
-  // Output: (M, 400) int32 tensor (packed bits, theta-major order)
+  // Output: (M, 400) int32 tensor (packed bits, d1-major order)
+  //         linear_bit = d1*6400 + theta*32 + r*2 + d0
+  //         First 200 words: d1=0 bits, Last 200 words: d1=1 bits
+  //
+  // This layout enables half-mask optimization since mask has duplicate d1 bits.
   //
   // IN-PLACE packing with grid-level sync: the kernel packs data into the
   // input buffer. Uses cooperative groups to ensure all reads complete before
@@ -290,8 +304,9 @@ torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
 torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
   // Input: (M, 400) int32 tensor packed in r-major order
   //        bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
-  // Output: (M, 400) int32 tensor packed in theta-major order
-  //        bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+  // Output: (M, 400) int32 tensor packed in d1-major order
+  //        bit[r,theta,d0,d1] at linear_bit = d1*6400 + theta*32 + r*2 + d0
+  //        First 200 words: d1=0 bits, Last 200 words: d1=1 bits
   TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(input.scalar_type() == at::kInt, "input dtype must be int32");
   TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
@@ -305,6 +320,34 @@ torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
   launch_repack_to_theta_major_cuda(
       reinterpret_cast<const uint32_t *>(input.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(output.data_ptr<int>()), (int)M, stream);
+
+  return output;
+}
+
+torch::Tensor pack_half_mask_cuda(torch::Tensor bits) {
+  // Input: (M, 16, 200, 2, 2) uint8 tensor with values in {0, 1}
+  // Output: (M, 200) int32 tensor (packed half-mask, d1=0 bits only)
+  //         linear_bit = theta*32 + r*2 + d0
+  //
+  // Half-mask stores only d1=0 bits since d1=1 is identical in real iris masks.
+  TORCH_CHECK(bits.is_cuda(), "bits must be CUDA tensor");
+  TORCH_CHECK(bits.scalar_type() == at::kByte, "bits dtype must be uint8");
+  TORCH_CHECK(bits.is_contiguous(), "bits must be contiguous");
+  TORCH_CHECK(bits.dim() == 5, "bits must have shape (M, 16, 200, 2, 2)");
+  TORCH_CHECK(bits.size(1) == 16 && bits.size(2) == 200 && bits.size(3) == 2 &&
+                  bits.size(4) == 2,
+              "bits must have shape (M, 16, 200, 2, 2)");
+
+  int64_t M = bits.size(0);
+  auto opts = torch::TensorOptions()
+                  .device(bits.device())
+                  .dtype(torch::kInt32);
+  auto output = torch::empty({M, K_WORDS_HALF}, opts);
+
+  auto stream = at::cuda::getDefaultCUDAStream();
+  launch_pack_half_mask_cuda(bits.data_ptr<uint8_t>(),
+                             reinterpret_cast<uint32_t *>(output.data_ptr<int>()),
+                             (int)M, stream);
 
   return output;
 }
@@ -331,9 +374,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("include_flags") = INCLUDE_ALL,
         py::arg("max_pairs") = 1000000);
   m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
-        "Pack iris bits to theta-major int32 words (CUDA)");
+        "Pack iris bits to d1-major int32 words (CUDA)");
+  m.def("pack_half_mask_cuda", &pack_half_mask_cuda,
+        "Pack mask bits to half-size int32 words - d1=0 only (CUDA)");
   m.def("repack_to_theta_major_cuda", &repack_to_theta_major_cuda,
-        "Repack int32 words from r-major to theta-major order (CUDA)");
+        "Repack int32 words from r-major to d1-major order (CUDA)");
 
   // Export classification constants
   m.attr("CATEGORY_TRUE_MATCH") = py::int_(CATEGORY_TRUE_MATCH);
