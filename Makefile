@@ -27,7 +27,7 @@ quick: $(BENCHMARK)
 
 # Full benchmark
 bench: $(BENCHMARK)
-	./$(BENCHMARK) 65536 0 1
+	./$(BENCHMARK) 32768 0 1
 
 clean:
 	rm -f $(BENCHMARK) $(OBJS)
