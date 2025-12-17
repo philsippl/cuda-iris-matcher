@@ -293,56 +293,35 @@ def run_sharding_benchmark(
     results = []
     
     if min_shards_list is None:
-        # Default: test with 1, num_devices, and 2*num_devices shards
-        min_shards_list = sorted(set([1, num_devices, num_devices * 2, 4]))
+        # Default: just test baseline (1) and one sharded config (4 shards for tiling)
+        min_shards_list = [1, 4]
     
-    print(f"\nAvailable CUDA devices: {num_devices}")
-    for i in range(num_devices):
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
     
     for M in sizes:
         n_pairs_self = M * (M - 1) // 2
-        n_pairs_ab = M * M
         
-        print(f"\n{'='*70}")
-        print(f"Sharding Benchmark: M={M:,}")
-        print(f"  Self-comparison pairs: {n_pairs_self:,}")
-        print(f"  A vs B pairs: {n_pairs_ab:,}")
-        print(f"{'='*70}")
+        print(f"\n  M={M:,} ({n_pairs_self:,} pairs)")
         
         # Generate data on CPU (sharding will distribute to GPUs)
         data = torch.randint(0, 2**31, (M, 400), dtype=torch.int32)
         mask = torch.full((M, 400), 0x7FFFFFFF, dtype=torch.int32)
         
-        # First, get baseline with non-sharded on single GPU
-        print(f"\n  [Baseline] Non-sharded on GPU 0...")
+        # Get baseline with non-sharded on single GPU
         data_gpu = data.cuda(0)
         mask_gpu = mask.cuda(0)
-        
-        # Use same max_pairs fraction as regular benchmark for fair comparison
         max_pairs_baseline = max(1, n_pairs_self // 100)
         
-        # Warmup
+        # Warmup + benchmark baseline
         for _ in range(warmup_runs):
-            ih.masked_hamming_cuda(
-                data_gpu, mask_gpu,
-                match_threshold=1.0, non_match_threshold=1.0,
-                include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_baseline
-            )
+            ih.masked_hamming_cuda(data_gpu, mask_gpu, match_threshold=1.0, max_pairs=max_pairs_baseline)
             torch.cuda.synchronize()
         
-        # Benchmark baseline using CUDA events for accurate timing
         baseline_times = []
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
         for _ in range(benchmark_runs):
             start_event.record()
-            ih.masked_hamming_cuda(
-                data_gpu, mask_gpu,
-                match_threshold=1.0, non_match_threshold=1.0,
-                include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_baseline
-            )
+            ih.masked_hamming_cuda(data_gpu, mask_gpu, match_threshold=1.0, max_pairs=max_pairs_baseline)
             end_event.record()
             torch.cuda.synchronize()
             baseline_times.append(start_event.elapsed_time(end_event))
@@ -350,9 +329,6 @@ def run_sharding_benchmark(
         baseline_mean = np.mean(baseline_times)
         baseline_std = np.std(baseline_times)
         baseline_throughput = n_pairs_self / (baseline_mean / 1000) / 1e6
-        
-        print(f"    Time: {baseline_mean:.2f} ± {baseline_std:.2f} ms")
-        print(f"    Throughput: {baseline_throughput:.2f} M pairs/s")
         
         results.append(ShardingBenchmarkResult(
             m_a=M, m_b=M, n_pairs=n_pairs_self,
@@ -367,42 +343,23 @@ def run_sharding_benchmark(
         del data_gpu, mask_gpu
         torch.cuda.empty_cache()
         
-        # Test sharded versions with different shard counts
-        for min_shards in min_shards_list:
-            if min_shards == 1:
-                continue  # Already tested as baseline
-            
-            print(f"\n  [Sharded] min_shards={min_shards}...")
-            
-            # Get actual shard count
-            shard_configs = ih.get_shard_info(M, M, min_shards=min_shards)
+        # Test sharded version (skip if min_shards=1 since that's baseline)
+        sharded_min = max(s for s in min_shards_list if s > 1) if any(s > 1 for s in min_shards_list) else None
+        
+        if sharded_min:
+            shard_configs = ih.get_shard_info(M, M, min_shards=sharded_min)
             actual_shards = len(shard_configs)
-            
-            # Use same max_pairs as baseline for fair comparison
             max_pairs_sharded = max(1, n_pairs_self // 100)
             
-            # Warmup
+            # Warmup + benchmark sharded
             for _ in range(warmup_runs):
-                ih.masked_hamming_sharded(
-                    data, mask,
-                    match_threshold=1.0, non_match_threshold=1.0,
-                    include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_sharded,
-                    min_shards=min_shards
-                )
+                ih.masked_hamming_sharded(data, mask, match_threshold=1.0, max_pairs=max_pairs_sharded, min_shards=sharded_min)
             
-            # Benchmark - use wall clock since sharding involves CPU coordination
-            # This measures true end-to-end latency including data movement
             sharded_times = []
             for _ in range(benchmark_runs):
-                torch.cuda.synchronize()  # Ensure GPU is idle
+                torch.cuda.synchronize()
                 start = time.perf_counter()
-                ih.masked_hamming_sharded(
-                    data, mask,
-                    match_threshold=1.0, non_match_threshold=1.0,
-                    include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_sharded,
-                    min_shards=min_shards
-                )
-                # No sync needed - sharded version syncs internally
+                ih.masked_hamming_sharded(data, mask, match_threshold=1.0, max_pairs=max_pairs_sharded, min_shards=sharded_min)
                 sharded_times.append((time.perf_counter() - start) * 1000)
             
             sharded_mean = np.mean(sharded_times)
@@ -410,10 +367,10 @@ def run_sharding_benchmark(
             sharded_throughput = n_pairs_self / (sharded_mean / 1000) / 1e6
             speedup = baseline_mean / sharded_mean
             
-            print(f"    Actual shards: {actual_shards}")
-            print(f"    Time: {sharded_mean:.2f} ± {sharded_std:.2f} ms")
-            print(f"    Throughput: {sharded_throughput:.2f} M pairs/s")
-            print(f"    Speedup vs single: {speedup:.2f}x")
+            # Print compact result line
+            print(f"    Baseline: {baseline_mean:.2f}ms ({baseline_throughput:.1f}M/s) | "
+                  f"Sharded ({actual_shards} tiles): {sharded_mean:.2f}ms ({sharded_throughput:.1f}M/s) | "
+                  f"Speedup: {speedup:.2f}x")
             
             results.append(ShardingBenchmarkResult(
                 m_a=M, m_b=M, n_pairs=n_pairs_self,
@@ -424,50 +381,10 @@ def run_sharding_benchmark(
                 speedup_vs_single=speedup,
                 n_runs=benchmark_runs,
             ))
+        else:
+            print(f"    Baseline: {baseline_mean:.2f}ms ({baseline_throughput:.1f}M/s)")
         
-        # Also test A vs B sharded
-        print(f"\n  [A vs B Sharded] Testing...")
-        data_b = torch.randint(0, 2**31, (M, 400), dtype=torch.int32)
-        mask_b = torch.full((M, 400), 0x7FFFFFFF, dtype=torch.int32)
-        
-        # Use 1% of pairs for fair comparison
-        max_pairs_ab = max(1, n_pairs_ab // 100)
-        
-        for min_shards in [1, max(min_shards_list)]:
-            # Warmup
-            for _ in range(warmup_runs):
-                ih.masked_hamming_ab_sharded(
-                    data, mask, data_b, mask_b,
-                    match_threshold=1.0, non_match_threshold=1.0,
-                    include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_ab,
-                    min_shards=min_shards
-                )
-            
-            # Benchmark
-            ab_times = []
-            for _ in range(benchmark_runs):
-                torch.cuda.synchronize()
-                start = time.perf_counter()
-                ih.masked_hamming_ab_sharded(
-                    data, mask, data_b, mask_b,
-                    match_threshold=1.0, non_match_threshold=1.0,
-                    include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs_ab,
-                    min_shards=min_shards
-                )
-                ab_times.append((time.perf_counter() - start) * 1000)
-            
-            ab_mean = np.mean(ab_times)
-            ab_std = np.std(ab_times)
-            ab_throughput = n_pairs_ab / (ab_mean / 1000) / 1e6
-            
-            shard_configs = ih.get_shard_info(M, M, min_shards=min_shards)
-            actual_shards = len(shard_configs)
-            
-            print(f"    min_shards={min_shards} (actual={actual_shards}): "
-                  f"{ab_mean:.2f} ± {ab_std:.2f} ms, "
-                  f"{ab_throughput:.2f} M pairs/s")
-        
-        del data, mask, data_b, mask_b
+        del data, mask
         gc.collect()
         torch.cuda.empty_cache()
     
@@ -475,26 +392,10 @@ def run_sharding_benchmark(
 
 
 def print_sharding_summary(results: List[ShardingBenchmarkResult]):
-    """Print sharding benchmark summary table."""
-    print("\n" + "=" * 100)
-    print("SHARDING BENCHMARK SUMMARY")
-    print("=" * 100)
-    print(f"{'M':>8} {'Pairs':>12} {'Shards':>8} {'Time (ms)':>16} {'Throughput':>16} {'Speedup':>10}")
-    print("-" * 100)
-    
-    for r in results:
-        speedup_str = f"{r.speedup_vs_single:.2f}x" if r.speedup_vs_single else "N/A"
-        print(
-            f"{r.m_a:>8,} "
-            f"{r.n_pairs:>12,} "
-            f"{r.num_shards:>8} "
-            f"{r.total_time_ms_mean:>10.2f} ± {r.total_time_ms_std:>4.2f} "
-            f"{r.pairs_per_second_millions:>12.2f} M/s "
-            f"{speedup_str:>10}"
-        )
-    
-    print("=" * 100)
-    print(f"Devices: {results[0].num_devices if results else 0}")
+    """Print sharding benchmark summary (already printed inline)."""
+    # Summary already printed per-size, just show device count
+    if results:
+        print(f"\n  GPUs available: {torch.cuda.device_count()}")
 
 
 def run_ab_benchmark(
