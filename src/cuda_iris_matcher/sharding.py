@@ -9,8 +9,9 @@ This module provides sharded versions of the iris matching functions that:
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Any
 
 import torch
 
@@ -35,6 +36,70 @@ class ShardConfig:
     a_end: int  # End index in A (exclusive)
     b_start: int  # Start index in B
     b_end: int  # End index in B (exclusive)
+
+
+@dataclass
+class ShardResult:
+    """Result from a single shard computation."""
+
+    indices: torch.Tensor  # [N, 2] int32 with global coordinates
+    categories: torch.Tensor  # [N] uint8
+    distances: torch.Tensor  # [N] float32
+    count: int
+
+
+def _run_shards_concurrent(
+    shards: List[ShardConfig],
+    shard_fn: Callable[[ShardConfig], Optional[ShardResult]],
+    max_workers: Optional[int] = None,
+) -> List[ShardResult]:
+    """Run shard computations concurrently using thread pool.
+
+    Uses concurrent execution only when there are multiple GPUs to benefit from
+    parallelism. For single-GPU cases, runs sequentially to avoid thread overhead.
+
+    Args:
+        shards: List of shard configurations
+        shard_fn: Function that takes a ShardConfig and returns ShardResult or None
+        max_workers: Max threads (None = number of unique devices in shards)
+
+    Returns:
+        List of non-None ShardResults
+    """
+    if len(shards) == 0:
+        return []
+
+    # Count unique devices
+    unique_devices = len(set(s.device_id for s in shards))
+
+    # Only use concurrent execution if there are multiple GPUs
+    # For single GPU, thread overhead hurts more than it helps
+    if unique_devices <= 1:
+        results = []
+        for shard in shards:
+            result = shard_fn(shard)
+            if result is not None:
+                results.append(result)
+        return results
+
+    # Multi-GPU: use concurrent execution
+    if max_workers is None:
+        max_workers = unique_devices
+
+    results = []
+
+    # Use ThreadPoolExecutor - PyTorch GPU ops release the GIL
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all shards
+        future_to_shard = {executor.submit(shard_fn, shard): shard for shard in shards}
+
+        # Collect results as they complete
+        for future in as_completed(future_to_shard):
+            result = future.result()
+            if result is not None:
+                results.append(result)
+
+    return results
 
 
 def _estimate_memory_bytes(m_a: int, m_b: int, k_words: int, max_pairs: int) -> int:
@@ -440,13 +505,8 @@ def masked_hamming_ab_sharded(
     labels_a_cpu = labels_a.cpu() if labels_a is not None and labels_a.is_cuda else labels_a
     labels_b_cpu = labels_b.cpu() if labels_b is not None and labels_b.is_cuda else labels_b
 
-    # Collect results from all shards
-    all_indices = []
-    all_categories = []
-    all_distances = []
-    total_count = 0
-
-    for shard in shards:
+    # Define shard processing function for concurrent execution
+    def process_shard(shard: ShardConfig) -> Optional[ShardResult]:
         with torch.cuda.device(shard.device_id):
             # For multi-GPU, copy tile to target device; for single GPU, slice in place
             if shard.device_id == primary_device:
@@ -471,13 +531,6 @@ def masked_hamming_ab_sharded(
                     shard.device_id
                 )
 
-            # Compute remaining pairs budget
-            remaining_pairs = max_pairs - total_count
-            if remaining_pairs <= 0:
-                break
-
-            tile_max_pairs = min(max_pairs_per_shard, remaining_pairs)
-
             # Run kernel on this tile
             indices, categories, distances, count = _C.masked_hamming_ab_cuda(
                 data_a_tile,
@@ -490,7 +543,7 @@ def masked_hamming_ab_sharded(
                 non_match_threshold,
                 is_similarity,
                 include_flags,
-                tile_max_pairs,
+                max_pairs_per_shard,
                 r_dim,
                 theta_dim,
                 d0_dim,
@@ -504,13 +557,19 @@ def masked_hamming_ab_sharded(
                 indices_cpu[:, 0] += shard.a_start
                 indices_cpu[:, 1] += shard.b_start
 
-                all_indices.append(indices_cpu)
-                all_categories.append(categories[:n].cpu())
-                all_distances.append(distances[:n].cpu())
-                total_count += n
+                return ShardResult(
+                    indices=indices_cpu,
+                    categories=categories[:n].cpu(),
+                    distances=distances[:n].cpu(),
+                    count=n,
+                )
+            return None
+
+    # Run shards concurrently across devices
+    shard_results = _run_shards_concurrent(shards, process_shard)
 
     # Aggregate results
-    if total_count == 0:
+    if len(shard_results) == 0:
         # Return empty tensors
         return (
             torch.zeros((0, 2), dtype=torch.int32),
@@ -518,6 +577,22 @@ def masked_hamming_ab_sharded(
             torch.zeros((0,), dtype=torch.float32),
             torch.tensor([0], dtype=torch.int32),
         )
+
+    # Collect and concatenate results, respecting max_pairs limit
+    all_indices = []
+    all_categories = []
+    all_distances = []
+    total_count = 0
+
+    for result in shard_results:
+        remaining = max_pairs - total_count
+        if remaining <= 0:
+            break
+        take_count = min(result.count, remaining)
+        all_indices.append(result.indices[:take_count])
+        all_categories.append(result.categories[:take_count])
+        all_distances.append(result.distances[:take_count])
+        total_count += take_count
 
     pair_indices = torch.cat(all_indices, dim=0)
     categories = torch.cat(all_categories, dim=0)
@@ -609,13 +684,8 @@ def masked_hamming_sharded(
     # Labels stay on CPU (small)
     labels_cpu = labels.cpu() if labels is not None and labels.is_cuda else labels
 
-    # Collect results from all shards
-    all_indices = []
-    all_categories = []
-    all_distances = []
-    total_count = 0
-
-    for shard in shards:
+    # Define shard processing function for concurrent execution
+    def process_shard(shard: ShardConfig) -> Optional[ShardResult]:
         with torch.cuda.device(shard.device_id):
             # For single GPU, slice in place; for multi-GPU, copy tile to device
             if shard.device_id == primary_device:
@@ -639,23 +709,18 @@ def masked_hamming_sharded(
                     shard.device_id
                 )
 
-            # Compute remaining pairs budget
-            remaining_pairs = max_pairs - total_count
-            if remaining_pairs <= 0:
-                break
-
             # For diagonal tiles (a_start == b_start), we'll filter to lower triangle later
             # so we need to request more pairs from the kernel (roughly 2x for diagonal)
             is_diagonal = shard.a_start == shard.b_start
-            # For diagonal tiles, request full tile size since about half will be filtered
             tile_size_a = shard.a_end - shard.a_start
             tile_size_b = shard.b_end - shard.b_start
             if is_diagonal:
-                # Diagonal tile: request all pairs, we'll filter to lower triangle
+                # Diagonal tile: need to request all pairs since we filter to lower triangle
+                # and A vs B kernel returns pairs in arbitrary order
                 tile_max_pairs = tile_size_a * tile_size_b
             else:
                 # Off-diagonal lower triangle tile: all pairs are valid
-                tile_max_pairs = min(max_pairs_per_shard, remaining_pairs)
+                tile_max_pairs = max_pairs_per_shard
 
             # Run A vs B kernel
             indices, categories, distances, count = _C.masked_hamming_ab_cuda(
@@ -688,28 +753,48 @@ def masked_hamming_sharded(
 
                 # Filter to lower triangle: global_row > global_col
                 # This is needed for diagonal tiles where a_start == b_start
-                # and off-diagonal tiles that are strictly lower are already all valid
-                if shard.a_start == shard.b_start:
-                    # Diagonal tile - need to filter
+                if is_diagonal:
                     valid_mask = indices_cpu[:, 0] > indices_cpu[:, 1]
                     indices_cpu = indices_cpu[valid_mask]
                     categories_cpu = categories_cpu[valid_mask]
                     distances_cpu = distances_cpu[valid_mask]
 
                 if indices_cpu.size(0) > 0:
-                    all_indices.append(indices_cpu)
-                    all_categories.append(categories_cpu)
-                    all_distances.append(distances_cpu)
-                    total_count += indices_cpu.size(0)
+                    return ShardResult(
+                        indices=indices_cpu,
+                        categories=categories_cpu,
+                        distances=distances_cpu,
+                        count=indices_cpu.size(0),
+                    )
+            return None
+
+    # Run shards concurrently across devices
+    shard_results = _run_shards_concurrent(shards, process_shard)
 
     # Aggregate results
-    if total_count == 0:
+    if len(shard_results) == 0:
         return (
             torch.zeros((0, 2), dtype=torch.int32),
             torch.zeros((0,), dtype=torch.uint8),
             torch.zeros((0,), dtype=torch.float32),
             torch.tensor([0], dtype=torch.int32),
         )
+
+    # Collect and concatenate results, respecting max_pairs limit
+    all_indices = []
+    all_categories = []
+    all_distances = []
+    total_count = 0
+
+    for result in shard_results:
+        remaining = max_pairs - total_count
+        if remaining <= 0:
+            break
+        take_count = min(result.count, remaining)
+        all_indices.append(result.indices[:take_count])
+        all_categories.append(result.categories[:take_count])
+        all_distances.append(result.distances[:take_count])
+        total_count += take_count
 
     pair_indices = torch.cat(all_indices, dim=0)
     categories = torch.cat(all_categories, dim=0)
