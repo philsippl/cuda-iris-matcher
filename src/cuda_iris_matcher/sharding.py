@@ -712,12 +712,10 @@ def masked_hamming_sharded(
             # For diagonal tiles (a_start == b_start), we'll filter to lower triangle later
             # so we need to request more pairs from the kernel (roughly 2x for diagonal)
             is_diagonal = shard.a_start == shard.b_start
-            tile_size_a = shard.a_end - shard.a_start
-            tile_size_b = shard.b_end - shard.b_start
             if is_diagonal:
-                # Diagonal tile: need to request all pairs since we filter to lower triangle
-                # and A vs B kernel returns pairs in arbitrary order
-                tile_max_pairs = tile_size_a * tile_size_b
+                # Diagonal tile: request 2x max_pairs since ~half will be filtered out
+                # Cap at a reasonable limit to avoid blowing up memory/time
+                tile_max_pairs = min(max_pairs_per_shard * 2, 100_000)
             else:
                 # Off-diagonal lower triangle tile: all pairs are valid
                 tile_max_pairs = max_pairs_per_shard
@@ -755,9 +753,11 @@ def masked_hamming_sharded(
                 # This is needed for diagonal tiles where a_start == b_start
                 if is_diagonal:
                     valid_mask = indices_cpu[:, 0] > indices_cpu[:, 1]
-                    indices_cpu = indices_cpu[valid_mask]
-                    categories_cpu = categories_cpu[valid_mask]
-                    distances_cpu = distances_cpu[valid_mask]
+                    # Use nonzero + index_select for fast filtering (avoids slow bool indexing)
+                    valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+                    indices_cpu = torch.index_select(indices_cpu, 0, valid_indices)
+                    categories_cpu = torch.index_select(categories_cpu, 0, valid_indices)
+                    distances_cpu = torch.index_select(distances_cpu, 0, valid_indices)
 
                 if indices_cpu.size(0) > 0:
                     return ShardResult(
