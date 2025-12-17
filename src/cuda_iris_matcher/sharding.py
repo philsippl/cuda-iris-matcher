@@ -495,6 +495,22 @@ def masked_hamming_ab_sharded(
         else:
             mask_b_gpu = _pack_on_device(mask_b, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
 
+    # For single GPU without forced sharding, use non-sharded kernel directly
+    # (sharding adds overhead without benefit on single GPU)
+    if num_devices == 1 and min_shards <= 1:
+        labels_a_gpu = None
+        labels_b_gpu = None
+        if labels_a is not None:
+            labels_a_gpu = labels_a.cuda(primary_device) if not labels_a.is_cuda else labels_a
+        if labels_b is not None:
+            labels_b_gpu = labels_b.cuda(primary_device) if not labels_b.is_cuda else labels_b
+        return _C.masked_hamming_ab_cuda(
+            data_a_gpu, mask_a_gpu, data_b_gpu, mask_b_gpu,
+            labels_a_gpu, labels_b_gpu,
+            match_threshold, non_match_threshold, is_similarity,
+            include_flags, max_pairs, r_dim, theta_dim, d0_dim, d1_dim
+        )
+
     # Compute shard configurations
     shards = _compute_shard_configs(
         m_a, m_b, k_words, max_pairs, num_devices, min_shards, max_tile_size
