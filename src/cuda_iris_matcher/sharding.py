@@ -48,6 +48,17 @@ class ShardResult:
     count: int
 
 
+@dataclass
+class ShardKernelResult:
+    """Raw kernel output before CPU transfer (kept on GPU for async execution)."""
+
+    shard: ShardConfig
+    indices: torch.Tensor  # On GPU
+    categories: torch.Tensor  # On GPU
+    distances: torch.Tensor  # On GPU
+    count: torch.Tensor  # On GPU
+
+
 def _run_shards_concurrent(
     shards: List[ShardConfig],
     shard_fn: Callable[[ShardConfig], Optional[ShardResult]],
@@ -100,6 +111,92 @@ def _run_shards_concurrent(
                 results.append(result)
 
     return results
+
+
+def _run_shards_async(
+    shards: List[ShardConfig],
+    kernel_fn: Callable[[ShardConfig], ShardKernelResult],
+) -> List[ShardResult]:
+    """Run shard computations with true async kernel execution.
+
+    Launches all kernels without synchronization, allowing kernels on different
+    GPUs to execute concurrently. Only synchronizes at the end before collecting
+    results.
+
+    Args:
+        shards: List of shard configurations
+        kernel_fn: Function that launches kernel and returns raw GPU tensors
+
+    Returns:
+        List of ShardResults with data moved to CPU
+    """
+    if len(shards) == 0:
+        return []
+
+    # Group shards by device
+    device_ids = sorted(set(s.device_id for s in shards))
+    shards_by_device: dict[int, List[ShardConfig]] = {d: [] for d in device_ids}
+    for shard in shards:
+        shards_by_device[shard.device_id].append(shard)
+
+    # Create a stream per device for async execution
+    streams: dict[int, torch.cuda.Stream] = {}
+    for device_id in device_ids:
+        streams[device_id] = torch.cuda.Stream(device=device_id)
+
+    # Function to launch all shards on a single device
+    def launch_on_device(device_id: int) -> List[ShardKernelResult]:
+        stream = streams[device_id]
+        results = []
+        with torch.cuda.stream(stream):
+            for shard in shards_by_device[device_id]:
+                result = kernel_fn(shard)
+                results.append(result)
+        return results
+
+    # Launch kernels on all devices in parallel using ThreadPoolExecutor
+    # This parallelizes the Python overhead of kernel launches
+    all_kernel_results: List[ShardKernelResult] = []
+    if len(device_ids) == 1:
+        # Single GPU - no need for threads
+        all_kernel_results = launch_on_device(device_ids[0])
+    else:
+        # Multi-GPU - use one thread per device to parallelize launches
+        with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+            futures = {executor.submit(launch_on_device, d): d for d in device_ids}
+            # Collect results in device order for determinism
+            device_results = {}
+            for future in as_completed(futures):
+                device_id = futures[future]
+                device_results[device_id] = future.result()
+            # Flatten in device order
+            for device_id in device_ids:
+                all_kernel_results.extend(device_results[device_id])
+
+    # Now synchronize all devices - this is where we wait for all GPUs
+    for device_id in device_ids:
+        streams[device_id].synchronize()
+
+    # Process results (all kernels have completed)
+    final_results: List[ShardResult] = []
+    for kr in all_kernel_results:
+        n = kr.count.item()
+        if n > 0:
+            # Transfer to CPU and adjust indices
+            indices_cpu = kr.indices[:n].cpu()
+            indices_cpu[:, 0] += kr.shard.a_start
+            indices_cpu[:, 1] += kr.shard.b_start
+
+            final_results.append(
+                ShardResult(
+                    indices=indices_cpu,
+                    categories=kr.categories[:n].cpu(),
+                    distances=kr.distances[:n].cpu(),
+                    count=n,
+                )
+            )
+
+    return final_results
 
 
 def _estimate_memory_bytes(m_a: int, m_b: int, k_words: int, max_pairs: int) -> int:
@@ -182,14 +279,15 @@ def _pack_on_device(
         return data.cuda(device_id)
 
     # Need to pack - determine batch size based on memory
+    # Note: The CUDA kernel now handles cooperative launch limits internally by batching
     with torch.cuda.device(device_id):
         if batch_size is None:
             available_mem = _get_available_memory(device_id)
             bytes_per_sample = k_bits + k_words * 4  # unpacked + packed
             batch_size = max(1, int(available_mem * 0.4 / bytes_per_sample))
-            batch_size = min(batch_size, m)
+        batch_size = min(batch_size, m)
 
-        # If entire data fits, pack all at once
+        # If entire data fits in one batch, pack all at once
         if batch_size >= m:
             if data.is_cuda:
                 data_gpu = data.cuda(device_id) if data.device.index != device_id else data
@@ -215,6 +313,69 @@ def _pack_on_device(
             packed_gpu[start:end] = packed_batch
 
         return packed_gpu
+
+
+def _replicate_to_devices(
+    tensors: List[torch.Tensor],
+    device_ids: List[int],
+    primary_device: int = 0,
+) -> List[List[torch.Tensor]]:
+    """Replicate tensors to multiple GPU devices in parallel.
+
+    Uses ThreadPoolExecutor to parallelize the Python overhead of GPU-to-GPU copies.
+    Each thread handles copying to one target device.
+
+    Args:
+        tensors: List of tensors on the primary device to replicate
+        device_ids: List of target device IDs (should include primary_device)
+        primary_device: The device where tensors currently reside
+
+    Returns:
+        List of lists: outer index is tensor index, inner index matches device_ids order
+        E.g., result[0][1] is tensors[0] on device_ids[1]
+    """
+    if len(device_ids) <= 1:
+        # Single device - just return original tensors
+        return [[t] for t in tensors]
+
+    # Pre-allocate result structure
+    results: List[List[Optional[torch.Tensor]]] = [
+        [None] * len(device_ids) for _ in tensors
+    ]
+
+    # Identify which devices need copies
+    target_devices = [d for d in device_ids if d != primary_device]
+
+    # Set primary device results (no copy needed)
+    primary_idx = device_ids.index(primary_device)
+    for t_idx, tensor in enumerate(tensors):
+        results[t_idx][primary_idx] = tensor
+
+    if not target_devices:
+        return [[t] for t in tensors]  # type: ignore
+
+    # Function to copy all tensors to a single target device
+    def copy_to_device(device_id: int) -> Tuple[int, List[torch.Tensor]]:
+        dev_idx = device_ids.index(device_id)
+        copied = []
+        with torch.cuda.device(device_id):
+            stream = torch.cuda.Stream(device=device_id)
+            with torch.cuda.stream(stream):
+                for tensor in tensors:
+                    copied.append(tensor.to(device_id, non_blocking=True))
+            stream.synchronize()
+        return dev_idx, copied
+
+    # Launch copies to all target devices in parallel using threads
+    # This parallelizes the Python/C++ overhead of setting up GPU-to-GPU transfers
+    with ThreadPoolExecutor(max_workers=len(target_devices)) as executor:
+        futures = [executor.submit(copy_to_device, d) for d in target_devices]
+        for future in as_completed(futures):
+            dev_idx, copied = future.result()
+            for t_idx, tensor in enumerate(copied):
+                results[t_idx][dev_idx] = tensor
+
+    return results  # type: ignore
 
 
 def _compute_shard_configs(
@@ -318,8 +479,7 @@ def _compute_self_shard_configs(
     """Compute shard configurations for self-comparison (lower triangle only).
 
     For self-comparison, we need tiles that cover the lower triangle (i > j).
-    We use the A vs B kernel on tiles where (a_start, a_end) x (b_start, b_end)
-    potentially contains lower triangle elements.
+    Uses greedy load balancing to distribute work evenly across GPUs.
 
     Args:
         m: Total rows
@@ -332,8 +492,6 @@ def _compute_self_shard_configs(
     Returns:
         List of ShardConfig objects covering the lower triangle
     """
-    shards = []
-
     # Determine tile sizes based on memory constraints
     if max_tile_size is None:
         if num_devices > 0:
@@ -361,12 +519,20 @@ def _compute_self_shard_configs(
         n_tiles = max(n_tiles, math.ceil((-1 + math.sqrt(1 + 8 * min_shards)) / 2))
         n_tiles = min(n_tiles, m)
 
+    # For good load balancing, we need enough tiles for granular distribution
+    # Target at least 4*num_devices tiles for reasonable balance (since diagonal tiles have higher weight)
+    if num_devices > 1:
+        min_tiles_for_balance = 4 * num_devices
+        while n_tiles * (n_tiles + 1) // 2 < min_tiles_for_balance and n_tiles < m:
+            n_tiles += 1
+
     tile_size = math.ceil(m / n_tiles)
 
-    # Generate shard configs for lower triangle (including diagonal tiles)
-    # For the lower triangle, we need tiles where rows can be > cols
-    # This means tiles (i, j) where i >= j
-    device_idx = 0
+    # First pass: collect all tiles with their estimated work (not just pair counts)
+    # Measurements show diagonal tiles (self-comparison) have nearly same cost per pair
+    # as off-diagonal tiles (A-B comparison), so we use weight of 1.0
+    DIAGONAL_WEIGHT = 1.0
+    tiles_with_work: List[Tuple[int, int, int, int, int]] = []  # (a_start, a_end, b_start, b_end, work)
     for i in range(n_tiles):
         a_start = i * tile_size
         a_end = min((i + 1) * tile_size, m)
@@ -380,20 +546,45 @@ def _compute_self_shard_configs(
                 break
 
             # Only include if this tile can contain lower triangle elements
-            # Tile contains (row, col) pairs where row in [a_start, a_end) and col in [b_start, b_end)
-            # Lower triangle needs row > col
-            # This is possible if a_end-1 > b_start (max row > min col)
             if a_end > b_start:
-                shards.append(
-                    ShardConfig(
-                        device_id=device_idx % num_devices if num_devices > 0 else 0,
-                        a_start=a_start,
-                        a_end=a_end,
-                        b_start=b_start,
-                        b_end=b_end,
-                    )
-                )
-                device_idx += 1
+                a_size = a_end - a_start
+                b_size = b_end - b_start
+                # Diagonal tiles: lower triangle only, weighted higher
+                if a_start == b_start:
+                    pairs = a_size * (a_size - 1) // 2
+                    work = int(pairs * DIAGONAL_WEIGHT)
+                else:
+                    # Off-diagonal tiles: full rectangle
+                    work = a_size * b_size
+                tiles_with_work.append((a_start, a_end, b_start, b_end, work))
+
+    if num_devices <= 0 or num_devices == 1:
+        # Single device - no balancing needed
+        return [
+            ShardConfig(device_id=0, a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3])
+            for t in tiles_with_work
+        ]
+
+    # Greedy load balancing: assign largest tiles first to least loaded GPU
+    # Sort tiles by work (descending)
+    tiles_with_work.sort(key=lambda x: x[4], reverse=True)
+
+    # Track work per device
+    device_work = [0] * num_devices
+    tile_assignments: List[Tuple[int, int, int, int, int, int]] = []  # + device_id
+
+    for a_start, a_end, b_start, b_end, work in tiles_with_work:
+        # Assign to GPU with least work
+        min_device = min(range(num_devices), key=lambda d: device_work[d])
+        device_work[min_device] += work
+        tile_assignments.append((a_start, a_end, b_start, b_end, work, min_device))
+
+    # Create shard configs (sorted by device for better locality)
+    tile_assignments.sort(key=lambda x: (x[5], x[0], x[2]))  # Sort by device, then position
+    shards = [
+        ShardConfig(device_id=t[5], a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3])
+        for t in tile_assignments
+    ]
 
     return shards
 
@@ -469,35 +660,26 @@ def masked_hamming_ab_sharded(
     mask_a_is_packed = _is_packed(mask_a, k_words)
     mask_b_is_packed = _is_packed(mask_b, k_words)
 
-    # For single-device case or when data fits, pack everything on GPU first
-    # This avoids repeated CPU<->GPU transfers
-    primary_device = 0
-
-    # Pack data on GPU (handles batching internally if needed)
-    with torch.cuda.device(primary_device):
-        if data_a_is_packed:
-            data_a_gpu = data_a.cuda(primary_device) if not data_a.is_cuda else data_a
-        else:
-            data_a_gpu = _pack_on_device(data_a, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
-        if mask_a_is_packed:
-            mask_a_gpu = mask_a.cuda(primary_device) if not mask_a.is_cuda else mask_a
-        else:
-            mask_a_gpu = _pack_on_device(mask_a, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
-        if data_b_is_packed:
-            data_b_gpu = data_b.cuda(primary_device) if not data_b.is_cuda else data_b
-        else:
-            data_b_gpu = _pack_on_device(data_b, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
-        if mask_b_is_packed:
-            mask_b_gpu = mask_b.cuda(primary_device) if not mask_b.is_cuda else mask_b
-        else:
-            mask_b_gpu = _pack_on_device(mask_b, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
     # For single GPU without forced sharding, use non-sharded kernel directly
-    # (sharding adds overhead without benefit on single GPU)
     if num_devices == 1 and min_shards <= 1:
+        primary_device = 0
+        with torch.cuda.device(primary_device):
+            if data_a_is_packed:
+                data_a_gpu = data_a.cuda(primary_device) if not data_a.is_cuda else data_a
+            else:
+                data_a_gpu = _pack_on_device(data_a, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
+            if mask_a_is_packed:
+                mask_a_gpu = mask_a.cuda(primary_device) if not mask_a.is_cuda else mask_a
+            else:
+                mask_a_gpu = _pack_on_device(mask_a, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
+            if data_b_is_packed:
+                data_b_gpu = data_b.cuda(primary_device) if not data_b.is_cuda else data_b
+            else:
+                data_b_gpu = _pack_on_device(data_b, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
+            if mask_b_is_packed:
+                mask_b_gpu = mask_b.cuda(primary_device) if not mask_b.is_cuda else mask_b
+            else:
+                mask_b_gpu = _pack_on_device(mask_b, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
         labels_a_gpu = None
         labels_b_gpu = None
         if labels_a is not None:
@@ -521,68 +703,121 @@ def masked_hamming_ab_sharded(
     labels_a_cpu = labels_a.cpu() if labels_a is not None and labels_a.is_cuda else labels_a
     labels_b_cpu = labels_b.cpu() if labels_b is not None and labels_b.is_cuda else labels_b
 
-    # Define shard processing function for concurrent execution
-    def process_shard(shard: ShardConfig) -> Optional[ShardResult]:
-        with torch.cuda.device(shard.device_id):
-            # For multi-GPU, copy tile to target device; for single GPU, slice in place
-            if shard.device_id == primary_device:
-                data_a_tile = data_a_gpu[shard.a_start : shard.a_end]
-                mask_a_tile = mask_a_gpu[shard.a_start : shard.a_end]
-                data_b_tile = data_b_gpu[shard.b_start : shard.b_end]
-                mask_b_tile = mask_b_gpu[shard.b_start : shard.b_end]
+    # Ensure data is on CPU for direct transfers to each GPU
+    data_a_cpu = data_a.cpu() if data_a.is_cuda else data_a
+    mask_a_cpu = mask_a.cpu() if mask_a.is_cuda else mask_a
+    data_b_cpu = data_b.cpu() if data_b.is_cuda else data_b
+    mask_b_cpu = mask_b.cpu() if mask_b.is_cuda else mask_b
+
+    # Determine which row ranges each GPU needs for A and B
+    device_ids = sorted(set(s.device_id for s in shards))
+    device_a_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    device_b_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    for shard in shards:
+        device_a_ranges[shard.device_id].add((shard.a_start, shard.a_end))
+        device_b_ranges[shard.device_id].add((shard.b_start, shard.b_end))
+
+    def merge_ranges(ranges: set[Tuple[int, int]]) -> Tuple[int, int]:
+        if not ranges:
+            return (0, 0)
+        return (min(r[0] for r in ranges), max(r[1] for r in ranges))
+
+    device_a_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_a_ranges.items()}
+    device_b_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_b_ranges.items()}
+
+    # Transfer data directly from CPU to each GPU in parallel
+    def transfer_to_device(device_id: int) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        a_start, a_end = device_a_row_ranges[device_id]
+        b_start, b_end = device_b_row_ranges[device_id]
+        with torch.cuda.device(device_id):
+            # Transfer A slices
+            data_a_slice = data_a_cpu[a_start:a_end]
+            mask_a_slice = mask_a_cpu[a_start:a_end]
+            if data_a_is_packed:
+                data_a_gpu = data_a_slice.cuda(device_id)
             else:
-                # Multi-GPU: copy tile to this device
-                data_a_tile = data_a_gpu[shard.a_start : shard.a_end].cuda(shard.device_id)
-                mask_a_tile = mask_a_gpu[shard.a_start : shard.a_end].cuda(shard.device_id)
-                data_b_tile = data_b_gpu[shard.b_start : shard.b_end].cuda(shard.device_id)
-                mask_b_tile = mask_b_gpu[shard.b_start : shard.b_end].cuda(shard.device_id)
+                data_a_gpu = _pack_on_device(data_a_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
+            if mask_a_is_packed:
+                mask_a_gpu = mask_a_slice.cuda(device_id)
+            else:
+                mask_a_gpu = _pack_on_device(mask_a_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
 
-            labels_a_tile = None
-            labels_b_tile = None
-            if labels_a_cpu is not None and labels_b_cpu is not None:
-                labels_a_tile = labels_a_cpu[shard.a_start : shard.a_end].cuda(
-                    shard.device_id
-                )
-                labels_b_tile = labels_b_cpu[shard.b_start : shard.b_end].cuda(
-                    shard.device_id
-                )
+            # Transfer B slices
+            data_b_slice = data_b_cpu[b_start:b_end]
+            mask_b_slice = mask_b_cpu[b_start:b_end]
+            if data_b_is_packed:
+                data_b_gpu = data_b_slice.cuda(device_id)
+            else:
+                data_b_gpu = _pack_on_device(data_b_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
+            if mask_b_is_packed:
+                mask_b_gpu = mask_b_slice.cuda(device_id)
+            else:
+                mask_b_gpu = _pack_on_device(mask_b_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
 
-            # Run kernel on this tile
-            indices, categories, distances, count = _C.masked_hamming_ab_cuda(
-                data_a_tile,
-                mask_a_tile,
-                data_b_tile,
-                mask_b_tile,
-                labels_a_tile,
-                labels_b_tile,
-                match_threshold,
-                non_match_threshold,
-                is_similarity,
-                include_flags,
-                max_pairs_per_shard,
-                r_dim,
-                theta_dim,
-                d0_dim,
-                d1_dim,
+            torch.cuda.synchronize(device_id)
+        return device_id, data_a_gpu, mask_a_gpu, data_b_gpu, mask_b_gpu, a_start, b_start
+
+    # Transfer to all GPUs in parallel
+    device_data: dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = {}
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        futures = [executor.submit(transfer_to_device, d) for d in device_ids]
+        for future in as_completed(futures):
+            device_id, da, ma, db, mb, a_off, b_off = future.result()
+            device_data[device_id] = (da, ma, db, mb, a_off, b_off)
+
+    # Define kernel launch function
+    def launch_kernel(shard: ShardConfig) -> ShardKernelResult:
+        data_a_gpu, mask_a_gpu, data_b_gpu, mask_b_gpu, a_offset, b_offset = device_data[shard.device_id]
+
+        # Adjust indices relative to the data slices on this device
+        local_a_start = shard.a_start - a_offset
+        local_a_end = shard.a_end - a_offset
+        local_b_start = shard.b_start - b_offset
+        local_b_end = shard.b_end - b_offset
+
+        data_a_tile = data_a_gpu[local_a_start:local_a_end]
+        mask_a_tile = mask_a_gpu[local_a_start:local_a_end]
+        data_b_tile = data_b_gpu[local_b_start:local_b_end]
+        mask_b_tile = mask_b_gpu[local_b_start:local_b_end]
+
+        labels_a_tile = None
+        labels_b_tile = None
+        if labels_a_cpu is not None and labels_b_cpu is not None:
+            labels_a_tile = labels_a_cpu[shard.a_start:shard.a_end].cuda(
+                shard.device_id, non_blocking=True
+            )
+            labels_b_tile = labels_b_cpu[shard.b_start:shard.b_end].cuda(
+                shard.device_id, non_blocking=True
             )
 
-            n = count.item()
-            if n > 0:
-                # Adjust indices to global coordinates
-                indices_cpu = indices[:n].cpu()
-                indices_cpu[:, 0] += shard.a_start
-                indices_cpu[:, 1] += shard.b_start
+        indices, categories, distances, count = _C.masked_hamming_ab_cuda_async(
+            data_a_tile,
+            mask_a_tile,
+            data_b_tile,
+            mask_b_tile,
+            labels_a_tile,
+            labels_b_tile,
+            match_threshold,
+            non_match_threshold,
+            is_similarity,
+            include_flags,
+            max_pairs_per_shard,
+            r_dim,
+            theta_dim,
+            d0_dim,
+            d1_dim,
+        )
 
-                return ShardResult(
-                    indices=indices_cpu,
-                    categories=categories[:n].cpu(),
-                    distances=distances[:n].cpu(),
-                    count=n,
-                )
-            return None
+        return ShardKernelResult(
+            shard=shard,
+            indices=indices,
+            categories=categories,
+            distances=distances,
+            count=count,
+        )
 
-    # Run shards concurrently across devices
-    shard_results = _run_shards_concurrent(shards, process_shard)
+    # Run shards with async kernel execution across devices
+    shard_results = _run_shards_async(shards, launch_kernel)
 
     # Aggregate results
     if len(shard_results) == 0:
@@ -678,22 +913,18 @@ def masked_hamming_sharded(
     data_is_packed = _is_packed(data, k_words)
     mask_is_packed = _is_packed(mask, k_words)
 
-    # Pack data on primary GPU (handles batching internally if needed)
-    primary_device = 0
-    with torch.cuda.device(primary_device):
-        if data_is_packed:
-            data_gpu = data.cuda(primary_device) if not data.is_cuda else data
-        else:
-            data_gpu = _pack_on_device(data, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
-        if mask_is_packed:
-            mask_gpu = mask.cuda(primary_device) if not mask.is_cuda else mask
-        else:
-            mask_gpu = _pack_on_device(mask, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
-
     # For single GPU without forced sharding, use non-sharded kernel directly
-    # (sharding adds overhead without benefit on single GPU)
     if num_devices == 1 and min_shards <= 1:
+        primary_device = 0
+        with torch.cuda.device(primary_device):
+            if data_is_packed:
+                data_gpu = data.cuda(primary_device) if not data.is_cuda else data
+            else:
+                data_gpu = _pack_on_device(data, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
+            if mask_is_packed:
+                mask_gpu = mask.cuda(primary_device) if not mask.is_cuda else mask
+            else:
+                mask_gpu = _pack_on_device(mask, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
         labels_gpu = None
         if labels is not None:
             labels_gpu = labels.cuda(primary_device) if not labels.is_cuda else labels
@@ -712,94 +943,134 @@ def masked_hamming_sharded(
     # Labels stay on CPU (small)
     labels_cpu = labels.cpu() if labels is not None and labels.is_cuda else labels
 
-    # Define shard processing function for concurrent execution
-    def process_shard(shard: ShardConfig) -> Optional[ShardResult]:
-        with torch.cuda.device(shard.device_id):
-            # For single GPU, slice in place; for multi-GPU, copy tile to device
-            if shard.device_id == primary_device:
-                data_a_tile = data_gpu[shard.a_start : shard.a_end]
-                mask_a_tile = mask_gpu[shard.a_start : shard.a_end]
-                data_b_tile = data_gpu[shard.b_start : shard.b_end]
-                mask_b_tile = mask_gpu[shard.b_start : shard.b_end]
-            else:
-                data_a_tile = data_gpu[shard.a_start : shard.a_end].cuda(shard.device_id)
-                mask_a_tile = mask_gpu[shard.a_start : shard.a_end].cuda(shard.device_id)
-                data_b_tile = data_gpu[shard.b_start : shard.b_end].cuda(shard.device_id)
-                mask_b_tile = mask_gpu[shard.b_start : shard.b_end].cuda(shard.device_id)
+    # Ensure data is on CPU for direct transfers to each GPU
+    data_cpu = data.cpu() if data.is_cuda else data
+    mask_cpu = mask.cpu() if mask.is_cuda else mask
 
-            labels_a_tile = None
-            labels_b_tile = None
+    # Determine which row ranges each GPU needs
+    device_ids = sorted(set(s.device_id for s in shards))
+    device_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    for shard in shards:
+        device_ranges[shard.device_id].add((shard.a_start, shard.a_end))
+        device_ranges[shard.device_id].add((shard.b_start, shard.b_end))
+
+    # Merge overlapping ranges and compute unique rows needed per device
+    def merge_ranges(ranges: set[Tuple[int, int]]) -> Tuple[int, int]:
+        """Merge ranges into a single contiguous range (min_start, max_end)."""
+        if not ranges:
+            return (0, 0)
+        min_start = min(r[0] for r in ranges)
+        max_end = max(r[1] for r in ranges)
+        return (min_start, max_end)
+
+    device_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_ranges.items()}
+
+    # Transfer data directly from CPU to each GPU (only needed rows) in parallel
+    def transfer_to_device(device_id: int) -> Tuple[int, torch.Tensor, torch.Tensor, int]:
+        """Transfer needed rows to a GPU, pack if needed, return (device_id, data, mask, offset)."""
+        row_start, row_end = device_row_ranges[device_id]
+        with torch.cuda.device(device_id):
+            data_slice = data_cpu[row_start:row_end]
+            mask_slice = mask_cpu[row_start:row_end]
+
+            if data_is_packed:
+                data_gpu = data_slice.cuda(device_id)
+            else:
+                data_gpu = _pack_on_device(data_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
+
+            if mask_is_packed:
+                mask_gpu = mask_slice.cuda(device_id)
+            else:
+                mask_gpu = _pack_on_device(mask_slice, device_id, r_dim, theta_dim, d0_dim, d1_dim)
+
+            torch.cuda.synchronize(device_id)
+        return device_id, data_gpu, mask_gpu, row_start
+
+    # Transfer to all GPUs in parallel
+    device_data: dict[int, Tuple[torch.Tensor, torch.Tensor, int]] = {}
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        futures = [executor.submit(transfer_to_device, d) for d in device_ids]
+        for future in as_completed(futures):
+            device_id, data_gpu, mask_gpu, offset = future.result()
+            device_data[device_id] = (data_gpu, mask_gpu, offset)
+
+    # Define kernel launch function (returns GPU tensors without sync)
+    def launch_kernel(shard: ShardConfig) -> ShardKernelResult:
+        data_gpu, mask_gpu, row_offset = device_data[shard.device_id]
+
+        # Adjust indices relative to the data slice on this device
+        local_a_start = shard.a_start - row_offset
+        local_a_end = shard.a_end - row_offset
+        local_b_start = shard.b_start - row_offset
+        local_b_end = shard.b_end - row_offset
+
+        data_a_tile = data_gpu[local_a_start:local_a_end]
+        mask_a_tile = mask_gpu[local_a_start:local_a_end]
+        data_b_tile = data_gpu[local_b_start:local_b_end]
+        mask_b_tile = mask_gpu[local_b_start:local_b_end]
+
+        labels_a_tile = None
+        labels_b_tile = None
+        if labels_cpu is not None:
+            labels_a_tile = labels_cpu[shard.a_start:shard.a_end].cuda(
+                shard.device_id, non_blocking=True
+            )
+            labels_b_tile = labels_cpu[shard.b_start:shard.b_end].cuda(
+                shard.device_id, non_blocking=True
+            )
+
+        is_diagonal = shard.a_start == shard.b_start
+
+        if is_diagonal:
+            labels_tile = None
             if labels_cpu is not None:
-                labels_a_tile = labels_cpu[shard.a_start : shard.a_end].cuda(
-                    shard.device_id
-                )
-                labels_b_tile = labels_cpu[shard.b_start : shard.b_end].cuda(
-                    shard.device_id
+                labels_tile = labels_cpu[shard.a_start:shard.a_end].cuda(
+                    shard.device_id, non_blocking=True
                 )
 
-            is_diagonal = shard.a_start == shard.b_start
+            indices, categories, distances, count = _C.masked_hamming_cuda_async(
+                data_a_tile,
+                mask_a_tile,
+                labels_tile,
+                match_threshold,
+                non_match_threshold,
+                is_similarity,
+                include_flags,
+                max_pairs_per_shard,
+                r_dim,
+                theta_dim,
+                d0_dim,
+                d1_dim,
+            )
+        else:
+            indices, categories, distances, count = _C.masked_hamming_ab_cuda_async(
+                data_a_tile,
+                mask_a_tile,
+                data_b_tile,
+                mask_b_tile,
+                labels_a_tile,
+                labels_b_tile,
+                match_threshold,
+                non_match_threshold,
+                is_similarity,
+                include_flags,
+                max_pairs_per_shard,
+                r_dim,
+                theta_dim,
+                d0_dim,
+                d1_dim,
+            )
 
-            if is_diagonal:
-                # Diagonal tile: use native self-comparison kernel (computes lower triangle only)
-                # This is 2x faster than A vs B kernel + filtering
-                labels_tile = None
-                if labels_cpu is not None:
-                    labels_tile = labels_cpu[shard.a_start : shard.a_end].cuda(shard.device_id)
+        return ShardKernelResult(
+            shard=shard,
+            indices=indices,
+            categories=categories,
+            distances=distances,
+            count=count,
+        )
 
-                indices, categories, distances, count = _C.masked_hamming_cuda(
-                    data_a_tile,
-                    mask_a_tile,
-                    labels_tile,
-                    match_threshold,
-                    non_match_threshold,
-                    is_similarity,
-                    include_flags,
-                    max_pairs_per_shard,
-                    r_dim,
-                    theta_dim,
-                    d0_dim,
-                    d1_dim,
-                )
-            else:
-                # Off-diagonal tile: use A vs B kernel (all pairs are in lower triangle)
-                indices, categories, distances, count = _C.masked_hamming_ab_cuda(
-                    data_a_tile,
-                    mask_a_tile,
-                    data_b_tile,
-                    mask_b_tile,
-                    labels_a_tile,
-                    labels_b_tile,
-                    match_threshold,
-                    non_match_threshold,
-                    is_similarity,
-                    include_flags,
-                    max_pairs_per_shard,
-                    r_dim,
-                    theta_dim,
-                    d0_dim,
-                    d1_dim,
-                )
-
-            n = count.item()
-            if n > 0:
-                # Adjust indices to global coordinates
-                indices_cpu = indices[:n].cpu().clone()
-                indices_cpu[:, 0] += shard.a_start  # Row from A
-                indices_cpu[:, 1] += shard.b_start  # Col from B
-
-                categories_cpu = categories[:n].cpu()
-                distances_cpu = distances[:n].cpu()
-
-                return ShardResult(
-                    indices=indices_cpu,
-                    categories=categories_cpu,
-                    distances=distances_cpu,
-                    count=n,
-                )
-            return None
-
-    # Run shards concurrently across devices
-    shard_results = _run_shards_concurrent(shards, process_shard)
+    # Run shards with async kernel execution across devices
+    shard_results = _run_shards_async(shards, launch_kernel)
 
     # Aggregate results
     if len(shard_results) == 0:

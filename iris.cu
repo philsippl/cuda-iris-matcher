@@ -492,7 +492,8 @@ __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-__global__ void pack_theta_major_kernel(uint8_t *data, int M, int r_dim,
+__global__ void pack_theta_major_kernel(uint8_t *data, uint32_t *output,
+                                        int M, int row_offset, int r_dim,
                                         int theta_dim, int d0_dim, int d1_dim,
                                         int k_bits, int k_words,
                                         int bits_per_theta_col,
@@ -553,7 +554,8 @@ __global__ void pack_theta_major_kernel(uint8_t *data, int M, int r_dim,
   grid.sync();
 
   // Now safe to write - all reads are complete
-  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * k_words;
+  // Use row_offset to compute correct output position for batched calls
+  uint32_t *out_row = output + (row_offset + m) * k_words;
   for (int i = 0; i < num_words; i++) {
     out_row[word_indices[i]] = packed_words[i];
   }
@@ -562,6 +564,7 @@ __global__ void pack_theta_major_kernel(uint8_t *data, int M, int r_dim,
 // C++/Python-facing launcher for packing kernel.
 // Packs M * k_bits bytes (uint8) into M * k_words int32 words IN-PLACE.
 // Uses cooperative kernel launch for grid-level synchronization.
+// Automatically batches if M exceeds device cooperative launch limits.
 extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M, int r_dim,
                                              int theta_dim, int d0_dim,
                                              int d1_dim, cudaStream_t stream) {
@@ -569,12 +572,38 @@ extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M, int r_dim,
   int threads = 256;
   size_t smem = ((cfg.k_bits + 3) / 4) * 4; // Aligned to 4 bytes
 
-  void *args[] = {&data,          &M,           &cfg.r_dim,
-                  &cfg.theta_dim, &cfg.d0_dim,  &cfg.d1_dim,
-                  &cfg.k_bits,    &cfg.k_words, &cfg.bits_per_theta_col,
-                  &cfg.inner_size};
-  cudaLaunchCooperativeKernel((void *)pack_theta_major_kernel, dim3(M),
-                              dim3(threads), args, smem, stream);
+  // Output is written to the same memory, reinterpreted as uint32
+  uint32_t *output = reinterpret_cast<uint32_t *>(data);
+
+  // Query max blocks for cooperative launch on current device
+  int device;
+  cudaGetDevice(&device);
+  int numBlocksPerSm;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm,
+                                                 pack_theta_major_kernel,
+                                                 threads, smem);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  int maxBlocks = numBlocksPerSm * prop.multiProcessorCount;
+
+  // Process in batches if M exceeds cooperative launch limit
+  // Use size_t for offset calculations to avoid integer overflow with large M
+  for (int start = 0; start < M; start += maxBlocks) {
+    int batch_M = min(M - start, maxBlocks);
+    // Use size_t to prevent overflow: start * k_bits can exceed INT32_MAX
+    uint8_t *batch_data = data + (size_t)start * cfg.k_bits;
+
+    void *args[] = {&batch_data,    &output,      &batch_M,     &start,
+                    &cfg.r_dim,     &cfg.theta_dim, &cfg.d0_dim,  &cfg.d1_dim,
+                    &cfg.k_bits,    &cfg.k_words, &cfg.bits_per_theta_col,
+                    &cfg.inner_size};
+    cudaLaunchCooperativeKernel((void *)pack_theta_major_kernel, dim3(batch_M),
+                                dim3(threads), args, smem, stream);
+    // Must sync between batches since cooperative kernel uses grid sync
+    if (start + maxBlocks < M) {
+      cudaStreamSynchronize(stream);
+    }
+  }
 }
 
 // ----------------- Repack u32 from r-major to theta-major -----------------
