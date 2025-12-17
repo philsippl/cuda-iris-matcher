@@ -23,6 +23,20 @@ DEFAULT_R_DIM = _C.DEFAULT_R_DIM
 DEFAULT_THETA_DIM = _C.DEFAULT_THETA_DIM
 DEFAULT_D0_DIM = _C.DEFAULT_D0_DIM
 DEFAULT_D1_DIM = _C.DEFAULT_D1_DIM
+DEFAULT_DIMS = (DEFAULT_R_DIM, DEFAULT_THETA_DIM, DEFAULT_D0_DIM, DEFAULT_D1_DIM)
+
+
+def _resolve_dims(
+    dims: Optional[Tuple[int, int, int, int]],
+    r_dim: int,
+    theta_dim: int,
+    d0_dim: int,
+    d1_dim: int,
+) -> Tuple[int, int, int, int]:
+    """Resolve dimensions from either dims tuple or individual parameters."""
+    if dims is not None:
+        return dims
+    return (r_dim, theta_dim, d0_dim, d1_dim)
 
 
 def masked_hamming_cuda(
@@ -34,6 +48,7 @@ def masked_hamming_cuda(
     is_similarity: bool = False,
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
+    dims: Optional[Tuple[int, int, int, int]] = None,
     r_dim: int = DEFAULT_R_DIM,
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
@@ -56,6 +71,8 @@ def masked_hamming_cuda(
         include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
                        Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        dims: Optional tuple (r_dim, theta_dim, d0_dim, d1_dim). If provided, overrides
+              individual dimension parameters.
         r_dim: Radial dimension of iris code (default: 16)
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
@@ -72,6 +89,7 @@ def masked_hamming_cuda(
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
     """
+    r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.masked_hamming_cuda(
         data, mask, labels,
         match_threshold, non_match_threshold,
@@ -92,6 +110,7 @@ def masked_hamming_ab_cuda(
     is_similarity: bool = False,
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
+    dims: Optional[Tuple[int, int, int, int]] = None,
     r_dim: int = DEFAULT_R_DIM,
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
@@ -118,6 +137,8 @@ def masked_hamming_ab_cuda(
         include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
                        Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        dims: Optional tuple (r_dim, theta_dim, d0_dim, d1_dim). If provided, overrides
+              individual dimension parameters.
         r_dim: Radial dimension of iris code (default: 16)
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
@@ -134,6 +155,7 @@ def masked_hamming_ab_cuda(
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
     """
+    r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.masked_hamming_ab_cuda(
         data_a, mask_a, data_b, mask_b,
         labels_a, labels_b,
@@ -145,6 +167,7 @@ def masked_hamming_ab_cuda(
 
 def pack_theta_major_cuda(
     bits: torch.Tensor,
+    dims: Optional[Tuple[int, int, int, int]] = None,
     r_dim: int = DEFAULT_R_DIM,
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
@@ -156,6 +179,8 @@ def pack_theta_major_cuda(
     Args:
         bits: CUDA uint8 tensor of shape (M, r_dim, theta_dim, d0_dim, d1_dim) with values in {0, 1}.
               Modified in-place; do not use after this call.
+        dims: Optional tuple (r_dim, theta_dim, d0_dim, d1_dim). If provided, overrides
+              individual dimension parameters.
         r_dim: Radial dimension of iris code (default: 16)
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
@@ -169,11 +194,13 @@ def pack_theta_major_cuda(
         - r_dim * d0_dim * d1_dim must be divisible by 32 (for whole-word theta shifts)
         - r_dim * theta_dim * d0_dim * d1_dim must be divisible by 256 (TensorCore alignment)
     """
+    r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.pack_theta_major_cuda(bits, r_dim, theta_dim, d0_dim, d1_dim)
 
 
 def repack_to_theta_major_cuda(
     input: torch.Tensor,
+    dims: Optional[Tuple[int, int, int, int]] = None,
     r_dim: int = DEFAULT_R_DIM,
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
@@ -184,6 +211,8 @@ def repack_to_theta_major_cuda(
 
     Args:
         input: CUDA int32 tensor of shape (M, k_words) packed in r-major order.
+        dims: Optional tuple (r_dim, theta_dim, d0_dim, d1_dim). If provided, overrides
+              individual dimension parameters.
         r_dim: Radial dimension of iris code (default: 16)
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
@@ -192,4 +221,5 @@ def repack_to_theta_major_cuda(
     Returns:
         New CUDA int32 tensor of shape (M, k_words) packed in theta-major order.
     """
+    r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.repack_to_theta_major_cuda(input, r_dim, theta_dim, d0_dim, d1_dim)

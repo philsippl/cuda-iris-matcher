@@ -18,6 +18,7 @@ from .ops import (
     DEFAULT_THETA_DIM,
     DEFAULT_D0_DIM,
     DEFAULT_D1_DIM,
+    DEFAULT_DIMS,
 )
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "DEFAULT_THETA_DIM",
     "DEFAULT_D0_DIM",
     "DEFAULT_D1_DIM",
+    "DEFAULT_DIMS",
 ]
 
 
