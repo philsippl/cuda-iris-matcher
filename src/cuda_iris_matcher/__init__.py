@@ -13,6 +13,12 @@ from .ops import (
     INCLUDE_FNM,
     INCLUDE_TNM,
     INCLUDE_ALL,
+    # Dimension constants
+    DEFAULT_R_DIM,
+    DEFAULT_THETA_DIM,
+    DEFAULT_D0_DIM,
+    DEFAULT_D1_DIM,
+    DEFAULT_DIMS,
 )
 
 __all__ = [
@@ -30,6 +36,12 @@ __all__ = [
     "INCLUDE_FNM",
     "INCLUDE_TNM",
     "INCLUDE_ALL",
+    # Dimension constants
+    "DEFAULT_R_DIM",
+    "DEFAULT_THETA_DIM",
+    "DEFAULT_D0_DIM",
+    "DEFAULT_D1_DIM",
+    "DEFAULT_DIMS",
 ]
 
 

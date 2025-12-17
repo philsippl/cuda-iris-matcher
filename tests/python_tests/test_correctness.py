@@ -11,26 +11,36 @@ import cuda_iris_matcher as ih
 from utils import rotation_aware_hamming_distance
 
 
-def test_matches_numpy_roll():
+@pytest.mark.parametrize(
+    "dims,M",
+    [
+        # Default dimensions
+        ((16, 200, 2, 2), 16),
+        # Non-default but constraint-valid:
+        # - r_dim*d0_dim*d1_dim must be divisible by 32
+        # - r_dim*theta_dim*d0_dim*d1_dim must be divisible by 256
+        ((16, 256, 2, 2), 8),
+    ],
+)
+def test_matches_numpy_roll(dims, M):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    M = 16
-    code = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
-    mask = np.random.randint(0, 2, (M, 16, 200, 2, 2), dtype=np.uint8)
+    code = np.random.randint(0, 2, (M, *dims), dtype=np.uint8)
+    mask = np.random.randint(0, 2, (M, *dims), dtype=np.uint8)
 
     # Pack on GPU using CUDA kernel
     code_cuda = torch.from_numpy(code).cuda()
     mask_cuda = torch.from_numpy(mask).cuda()
-    data_t = ih.pack_theta_major(code_cuda)
-    mask_t = ih.pack_theta_major(mask_cuda)
+    data_t = ih.pack_theta_major(code_cuda, dims=dims)
+    mask_t = ih.pack_theta_major(mask_cuda, dims=dims)
 
     # New interface: returns (pair_indices, categories, distances, count)
     # Use high threshold and INCLUDE_ALL to get all pairs
     max_pairs = M * (M - 1) // 2
     pair_indices, categories, distances, count = ih.masked_hamming_cuda(
         data_t, mask_t, match_threshold=1.0, non_match_threshold=1.0,
-        include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs
+        include_flags=ih.INCLUDE_ALL, max_pairs=max_pairs, dims=dims,
     )
     torch.cuda.synchronize()
 
@@ -48,7 +58,9 @@ def test_matches_numpy_roll():
         i, j = pair_indices[k].tolist()
         cuda_dist = distances[k].item()
         ref_dist = ref.get((i, j), ref.get((j, i), -1))
-        assert abs(cuda_dist - ref_dist) <= 1e-5, f"Pair ({i},{j}): cuda={cuda_dist}, ref={ref_dist}"
+        assert abs(cuda_dist - ref_dist) <= 1e-5, (
+            f"dims={(r_dim,theta_dim,d0_dim,d1_dim)} pair=({i},{j}): cuda={cuda_dist}, ref={ref_dist}"
+        )
 
 
 def test_repack_to_theta_major():

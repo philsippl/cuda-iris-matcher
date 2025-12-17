@@ -152,7 +152,7 @@ __device__ inline void load_b_frag(const uint32_t *Bs_ext, uint32_t &b0,
   b1 = Bs_ext[base + tid + 4];
 }
 
-// ----------------- Minimum Fractional Hamming Distance kernel
+// --w--------------- Minimum Fractional Hamming Distance kernel
 // -----------------
 //
 // Optimized structure: process all shifts within the K-loop to maximize A data
@@ -163,6 +163,8 @@ __device__ inline void load_b_frag(const uint32_t *Bs_ext, uint32_t &b0,
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
     const uint32_t *__restrict__ premasked, const uint32_t *__restrict__ mask,
     int M,
+    // Iris config (runtime)
+    int k_words, int k_chunks, int words_per_shift,
     // Classification parameters
     const int32_t *__restrict__ labels, // [M] or nullptr (no classification)
     float match_threshold, float non_match_threshold, bool is_similarity,
@@ -226,7 +228,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
       int g_row = block_start + r;
       if (g_row < M) {
         __pipeline_memcpy_async(dst + idx,
-                                src + g_row * K_WORDS + chunk_word + w, 16);
+                                src + g_row * k_words + chunk_word + w, 16);
       } else {
         dst[idx] = dst[idx + 1] = dst[idx + 2] = dst[idx + 3] = 0;
       }
@@ -234,7 +236,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
   };
 
   auto load_chunk_B_ext = [&](uint32_t *dst, const uint32_t *src,
-                              int block_start, int chunk_idx, int shift_words) {
+                              int block_start, int chunk_idx,
+                              int shift_words_arg) {
     int chunk_word = chunk_idx * K_CHUNK_WORDS;
     int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
 
@@ -242,17 +245,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
       int r = idx / K_CHUNK_WORDS_EXT;
       int w = idx % K_CHUNK_WORDS_EXT;
       int g_row = block_start + r;
-      int g_word = chunk_word + w - 1 + shift_words;
+      int g_word = chunk_word + w - 1 + shift_words_arg;
 
       if (g_row < M) {
-        // Optimized wraparound: g_word is in [-31, 439] range
-        // Avoid expensive modulo by using conditional add/subtract
+        // Optimized wraparound: avoid expensive modulo
         int gw = g_word;
         if (gw < 0)
-          gw += K_WORDS;
-        else if (gw >= K_WORDS)
-          gw -= K_WORDS;
-        const uint32_t *src_ptr = src + g_row * K_WORDS + gw;
+          gw += k_words;
+        else if (gw >= k_words)
+          gw -= k_words;
+        const uint32_t *src_ptr = src + g_row * k_words + gw;
         __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
       } else {
         dst[idx] = 0;
@@ -263,7 +265,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
   // Process one theta-roll shift at a time (sequential to minimize register
   // pressure)
   for (int shift = -MAX_SHIFT; shift <= MAX_SHIFT; ++shift) {
-    int shift_words = shift * WORDS_PER_THETA_SHIFT;
+    int shift_words = shift * words_per_shift;
     int32_t c1_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
     int32_t c2_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
     int32_t c3_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
@@ -291,14 +293,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
       __syncthreads();
     }
 
-    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+    for (int kc = 0; kc < k_chunks; ++kc) {
       uint32_t *A_pm_buf = A_pm_stage(stage);
       uint32_t *A_m_buf = A_m_stage(stage);
       uint32_t *B_pm_buf = B_pm_stage(stage);
       uint32_t *B_m_buf = B_m_stage(stage);
 
       int next_stage = stage ^ 1;
-      if (kc + 1 < K_CHUNKS) {
+      if (kc + 1 < k_chunks) {
         load_chunk_A(A_pm_stage(next_stage), premasked, block_row_start,
                      (kc + 1) * K_CHUNK_WORDS);
         load_chunk_A(A_m_stage(next_stage), mask, block_row_start,
@@ -354,7 +356,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
         }
       }
 
-      if (kc + 1 < K_CHUNKS)
+      if (kc + 1 < k_chunks)
         __pipeline_wait_prior(0);
       __syncthreads();
       stage ^= 1;
@@ -472,23 +474,29 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
 
 __global__ void preprocess_kernel(const uint32_t *__restrict__ data,
                                   const uint32_t *__restrict__ mask,
-                                  uint32_t *__restrict__ premasked, int M) {
+                                  uint32_t *__restrict__ premasked, int M,
+                                  int k_words) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < M * K_WORDS) {
+  if (idx < M * k_words) {
     premasked[idx] = data[idx] & mask[idx];
   }
 }
 
 // ----------------- Pack theta-major kernel -----------------
-// Packs (M, 16, 200, 2, 2) uint8 bits into (M, 400) int32 words IN-PLACE.
-// Uses cooperative groups for grid-level sync to ensure all reads complete
-// before any writes. Input layout strides: r=800, theta=4, d0=2, d1=1
-// Output is theta-major: theta is fastest-varying in the packed bitstream.
+// Packs (M, R_DIM, THETA_DIM, 2, 2) uint8 bits into (M, K_WORDS) int32 words
+// IN-PLACE. Uses cooperative groups for grid-level sync to ensure all reads
+// complete before any writes. Input layout strides: r=THETA_DIM*4, theta=4,
+// d0=2, d1=1 Output is theta-major: theta is fastest-varying in the packed
+// bitstream.
 
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-__global__ void pack_theta_major_kernel(uint8_t *data, int M) {
+__global__ void pack_theta_major_kernel(uint8_t *data, int M, int r_dim,
+                                        int theta_dim, int d0_dim, int d1_dim,
+                                        int k_bits, int k_words,
+                                        int bits_per_theta_col,
+                                        int inner_size) {
   cg::grid_group grid = cg::this_grid();
 
   int m = blockIdx.x;
@@ -500,29 +508,37 @@ __global__ void pack_theta_major_kernel(uint8_t *data, int M) {
   uint8_t *bits_smem = reinterpret_cast<uint8_t *>(smem_raw);
 
   // Load row m from global memory into shared memory
-  const uint8_t *in_row = data + m * K_BITS;
-  for (int i = threadIdx.x; i < K_BITS; i += blockDim.x) {
+  const uint8_t *in_row = data + m * k_bits;
+  for (int i = threadIdx.x; i < k_bits; i += blockDim.x) {
     bits_smem[i] = in_row[i];
   }
   __syncthreads();
 
   // Pack into registers (not yet written to global memory)
-  uint32_t packed_words[K_WORDS / 256 + 1]; // Each thread handles ~2 words
+  // Dynamic array sizing: each thread handles k_words/blockDim.x + 1 words max
+  constexpr int MAX_WORDS_PER_THREAD = 16; // Generous upper bound
+  uint32_t packed_words[MAX_WORDS_PER_THREAD];
+  int word_indices[MAX_WORDS_PER_THREAD];
   int num_words = 0;
-  int word_indices[K_WORDS / 256 + 1];
 
-  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+  for (int w = threadIdx.x; w < k_words && num_words < MAX_WORDS_PER_THREAD;
+       w += blockDim.x) {
     uint32_t word = 0;
 
-#pragma unroll
     for (int b = 0; b < 32; b++) {
       int linear_bit = w * 32 + b;
-      int theta = linear_bit / 64;
-      int inner = linear_bit % 64;
-      int r = inner / 4;
-      int d0 = (inner / 2) % 2;
-      int d1 = inner % 2;
-      int src_idx = r * 800 + theta * 4 + d0 * 2 + d1;
+      // Theta-major output: linear_bit = theta * bits_per_theta_col +
+      //   r * inner_size + d0 * d1_dim + d1
+      int theta = linear_bit / bits_per_theta_col;
+      int inner = linear_bit % bits_per_theta_col;
+      int r = inner / inner_size;
+      int d_inner = inner % inner_size;
+      int d0 = d_inner / d1_dim;
+      int d1 = d_inner % d1_dim;
+      // R-major input: src_idx = r * (theta_dim * inner_size) +
+      //   theta * inner_size + d0 * d1_dim + d1
+      int src_idx =
+          r * (theta_dim * inner_size) + theta * inner_size + d0 * d1_dim + d1;
 
       if (bits_smem[src_idx]) {
         word |= (1u << b);
@@ -537,34 +553,42 @@ __global__ void pack_theta_major_kernel(uint8_t *data, int M) {
   grid.sync();
 
   // Now safe to write - all reads are complete
-  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * K_WORDS;
+  uint32_t *out_row = reinterpret_cast<uint32_t *>(data) + m * k_words;
   for (int i = 0; i < num_words; i++) {
     out_row[word_indices[i]] = packed_words[i];
   }
 }
 
 // C++/Python-facing launcher for packing kernel.
-// Packs M * 12800 bytes (uint8) into M * 400 int32 words IN-PLACE.
+// Packs M * k_bits bytes (uint8) into M * k_words int32 words IN-PLACE.
 // Uses cooperative kernel launch for grid-level synchronization.
-extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
-                                             cudaStream_t stream) {
+extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M, int r_dim,
+                                             int theta_dim, int d0_dim,
+                                             int d1_dim, cudaStream_t stream) {
+  IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim, d0_dim, d1_dim);
   int threads = 256;
-  size_t smem = ((K_BITS + 3) / 4) * 4; // 12800 bytes aligned
+  size_t smem = ((cfg.k_bits + 3) / 4) * 4; // Aligned to 4 bytes
 
-  void *args[] = {&data, &M};
+  void *args[] = {&data,          &M,           &cfg.r_dim,
+                  &cfg.theta_dim, &cfg.d0_dim,  &cfg.d1_dim,
+                  &cfg.k_bits,    &cfg.k_words, &cfg.bits_per_theta_col,
+                  &cfg.inner_size};
   cudaLaunchCooperativeKernel((void *)pack_theta_major_kernel, dim3(M),
                               dim3(threads), args, smem, stream);
 }
 
 // ----------------- Repack u32 from r-major to theta-major -----------------
-// Input: (M, 400) int32 packed in r-major order: bit[r,theta,d0,d1] at
-//        linear_bit = r*800 + theta*4 + d0*2 + d1
-// Output: (M, 400) int32 packed in theta-major order: bit[r,theta,d0,d1] at
-//        linear_bit = theta*64 + r*4 + d0*2 + d1
+// Input: (M, k_words) int32 packed in r-major order: bit[r,theta,d0,d1] at
+//        linear_bit = r*(theta_dim*inner_size) + theta*inner_size + d0*d1_dim +
+//        d1
+// Output: (M, k_words) int32 packed in theta-major order: bit[r,theta,d0,d1] at
+//        linear_bit = theta*bits_per_theta_col + r*inner_size + d0*d1_dim + d1
 
-__global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
-                                             uint32_t *__restrict__ output,
-                                             int M) {
+__global__ void
+repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
+                             uint32_t *__restrict__ output, int M, int r_dim,
+                             int theta_dim, int d0_dim, int d1_dim, int k_words,
+                             int bits_per_theta_col, int inner_size) {
   int m = blockIdx.x;
   if (m >= M)
     return;
@@ -572,29 +596,32 @@ __global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
   extern __shared__ uint32_t smem[];
 
   // Load entire row into shared memory
-  const uint32_t *in_row = input + m * K_WORDS;
-  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+  const uint32_t *in_row = input + m * k_words;
+  for (int w = threadIdx.x; w < k_words; w += blockDim.x) {
     smem[w] = in_row[w];
   }
   __syncthreads();
 
   // Repack to theta-major
-  uint32_t *out_row = output + m * K_WORDS;
-  for (int w = threadIdx.x; w < K_WORDS; w += blockDim.x) {
+  uint32_t *out_row = output + m * k_words;
+  for (int w = threadIdx.x; w < k_words; w += blockDim.x) {
     uint32_t word = 0;
 
-#pragma unroll
     for (int b = 0; b < 32; b++) {
-      // Output bit position (theta-major)
+      // Output bit position (theta-major): theta*bits_per_theta_col +
+      //   r*inner_size + d0*d1_dim + d1
       int dst_linear_bit = w * 32 + b;
-      int theta = dst_linear_bit / 64;
-      int inner = dst_linear_bit % 64;
-      int r = inner / 4;
-      int d0 = (inner / 2) % 2;
-      int d1 = inner % 2;
+      int theta = dst_linear_bit / bits_per_theta_col;
+      int inner = dst_linear_bit % bits_per_theta_col;
+      int r = inner / inner_size;
+      int d_inner = inner % inner_size;
+      int d0 = d_inner / d1_dim;
+      int d1 = d_inner % d1_dim;
 
-      // Source bit position (r-major)
-      int src_linear_bit = r * 800 + theta * 4 + d0 * 2 + d1;
+      // Source bit position (r-major): r*(theta_dim*inner_size) +
+      //   theta*inner_size + d0*d1_dim + d1
+      int src_linear_bit =
+          r * (theta_dim * inner_size) + theta * inner_size + d0 * d1_dim + d1;
       int src_word = src_linear_bit / 32;
       int src_bit = src_linear_bit % 32;
 
@@ -608,27 +635,34 @@ __global__ void repack_to_theta_major_kernel(const uint32_t *__restrict__ input,
 }
 
 // C++/Python-facing launcher for repacking kernel.
-// Repacks M * 400 int32 words from r-major to theta-major order.
+// Repacks M * k_words int32 words from r-major to theta-major order.
 extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   uint32_t *output, int M,
+                                                  int r_dim, int theta_dim,
+                                                  int d0_dim, int d1_dim,
                                                   cudaStream_t stream) {
+  IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim, d0_dim, d1_dim);
   int threads = 256;
-  size_t smem = K_WORDS * sizeof(uint32_t); // 400 words = 1600 bytes
+  size_t smem = cfg.k_words * sizeof(uint32_t);
 
-  repack_to_theta_major_kernel<<<M, threads, smem, stream>>>(input, output, M);
+  repack_to_theta_major_kernel<<<M, threads, smem, stream>>>(
+      input, output, M, cfg.r_dim, cfg.theta_dim, cfg.d0_dim, cfg.d1_dim,
+      cfg.k_words, cfg.bits_per_theta_col, cfg.inner_size);
 }
 
 // C++/Python-facing launcher (keeps launch config and smem sizing in one
 // place).
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    const int32_t *dLabels, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
-    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream) {
-  int total = M * K_WORDS;
-  preprocess_kernel<<<(total + 255) / 256, 256, 0, stream>>>(dData, dMask,
-                                                             dPremasked, M);
+    int r_dim, int theta_dim, const int32_t *dLabels, float match_threshold,
+    float non_match_threshold, bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream) {
+  IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim);
+
+  int total = M * cfg.k_words;
+  preprocess_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      dData, dMask, dPremasked, M, cfg.k_words);
 
   dim3 grid((M + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
   dim3 block(WARPS_PER_BLOCK * 32);
@@ -638,9 +672,10 @@ extern "C" void launch_masked_hamming_cuda(
       sizeof(uint32_t);
 
   min_hamming_kernel<<<grid, block, smem, stream>>>(
-      dPremasked, dMask, M, dLabels, match_threshold, non_match_threshold,
-      is_similarity, include_flags, dPairIndices, dCategories, dOutDistances,
-      dMatchCount, max_pairs);
+      dPremasked, dMask, M, cfg.k_words, cfg.k_chunks, cfg.words_per_shift,
+      dLabels, match_threshold, non_match_threshold, is_similarity,
+      include_flags, dPairIndices, dCategories, dOutDistances, dMatchCount,
+      max_pairs);
 }
 
 // ----------------- A vs B kernel: compares all pairs between two sets
@@ -655,6 +690,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
         const uint32_t *__restrict__ mask_A,
         const uint32_t *__restrict__ premasked_B,
         const uint32_t *__restrict__ mask_B, int M_A, int M_B,
+        // Iris config (runtime)
+        int k_words, int k_chunks, int words_per_shift,
         // Classification parameters
         const int32_t *__restrict__ labels_A, // [M_A] or nullptr
         const int32_t *__restrict__ labels_B, // [M_B] or nullptr
@@ -719,7 +756,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       int g_row = block_start + r;
       if (g_row < M_limit) {
         __pipeline_memcpy_async(dst + idx,
-                                src + g_row * K_WORDS + chunk_word + w, 16);
+                                src + g_row * k_words + chunk_word + w, 16);
       } else {
         dst[idx] = dst[idx + 1] = dst[idx + 2] = dst[idx + 3] = 0;
       }
@@ -728,8 +765,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
 
   // Lambda to load B chunks with extended halo (from set B)
   auto load_chunk_B_ext = [&](uint32_t *dst, const uint32_t *src,
-                              int block_start, int chunk_idx, int shift_words,
-                              int M_limit) {
+                              int block_start, int chunk_idx,
+                              int shift_words_arg, int M_limit) {
     int chunk_word = chunk_idx * K_CHUNK_WORDS;
     int num_elems = BLOCK_N * K_CHUNK_WORDS_EXT;
 
@@ -737,16 +774,16 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       int r = idx / K_CHUNK_WORDS_EXT;
       int w = idx % K_CHUNK_WORDS_EXT;
       int g_row = block_start + r;
-      int g_word = chunk_word + w - 1 + shift_words;
+      int g_word = chunk_word + w - 1 + shift_words_arg;
 
       if (g_row < M_limit) {
         // Optimized wraparound: avoid expensive modulo
         int gw = g_word;
         if (gw < 0)
-          gw += K_WORDS;
-        else if (gw >= K_WORDS)
-          gw -= K_WORDS;
-        const uint32_t *src_ptr = src + g_row * K_WORDS + gw;
+          gw += k_words;
+        else if (gw >= k_words)
+          gw -= k_words;
+        const uint32_t *src_ptr = src + g_row * k_words + gw;
         __pipeline_memcpy_async(dst + idx, src_ptr, sizeof(uint32_t));
       } else {
         dst[idx] = 0;
@@ -756,7 +793,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
 
   // Process one theta-roll shift at a time
   for (int shift = -MAX_SHIFT; shift <= MAX_SHIFT; ++shift) {
-    int shift_words = shift * WORDS_PER_THETA_SHIFT;
+    int shift_words = shift * words_per_shift;
     int32_t c1_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
     int32_t c2_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
     int32_t c3_frag[TILES_M_PER_WARP][TILES_N_PER_WARP][4];
@@ -785,14 +822,14 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
       __syncthreads();
     }
 
-    for (int kc = 0; kc < K_CHUNKS; ++kc) {
+    for (int kc = 0; kc < k_chunks; ++kc) {
       uint32_t *A_pm_buf = A_pm_stage(stage);
       uint32_t *A_m_buf = A_m_stage(stage);
       uint32_t *B_pm_buf = B_pm_stage(stage);
       uint32_t *B_m_buf = B_m_stage(stage);
 
       int next_stage = stage ^ 1;
-      if (kc + 1 < K_CHUNKS) {
+      if (kc + 1 < k_chunks) {
         load_chunk_A(A_pm_stage(next_stage), premasked_A, block_row_start,
                      (kc + 1) * K_CHUNK_WORDS, M_A);
         load_chunk_A(A_m_stage(next_stage), mask_A, block_row_start,
@@ -848,7 +885,7 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
         }
       }
 
-      if (kc + 1 < K_CHUNKS)
+      if (kc + 1 < k_chunks)
         __pipeline_wait_prior(0);
       __syncthreads();
       stage ^= 1;
@@ -965,18 +1002,20 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B, const int32_t *dLabels_A, const int32_t *dLabels_B,
-    float match_threshold, float non_match_threshold, bool is_similarity,
-    uint8_t include_flags, int32_t *dPairIndices, uint8_t *dCategories,
-    float *dOutDistances, unsigned int *dMatchCount, unsigned int max_pairs,
-    cudaStream_t stream) {
+    int M_A, int M_B, int r_dim, int theta_dim, const int32_t *dLabels_A,
+    const int32_t *dLabels_B, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
+    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream) {
+  IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim);
+
   // Preprocess both A and B sets
-  int total_A = M_A * K_WORDS;
-  int total_B = M_B * K_WORDS;
+  int total_A = M_A * cfg.k_words;
+  int total_B = M_B * cfg.k_words;
   preprocess_kernel<<<(total_A + 255) / 256, 256, 0, stream>>>(
-      dData_A, dMask_A, dPremasked_A, M_A);
+      dData_A, dMask_A, dPremasked_A, M_A, cfg.k_words);
   preprocess_kernel<<<(total_B + 255) / 256, 256, 0, stream>>>(
-      dData_B, dMask_B, dPremasked_B, M_B);
+      dData_B, dMask_B, dPremasked_B, M_B, cfg.k_words);
 
   dim3 grid((M_B + BLOCK_N - 1) / BLOCK_N, (M_A + BLOCK_M - 1) / BLOCK_M);
   dim3 block(WARPS_PER_BLOCK * 32);
@@ -986,8 +1025,8 @@ extern "C" void launch_masked_hamming_ab_cuda(
       sizeof(uint32_t);
 
   min_hamming_ab_kernel<<<grid, block, smem, stream>>>(
-      dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, dLabels_A,
-      dLabels_B, match_threshold, non_match_threshold, is_similarity,
-      include_flags, dPairIndices, dCategories, dOutDistances, dMatchCount,
-      max_pairs);
+      dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, cfg.k_words,
+      cfg.k_chunks, cfg.words_per_shift, dLabels_A, dLabels_B, match_threshold,
+      non_match_threshold, is_similarity, include_flags, dPairIndices,
+      dCategories, dOutDistances, dMatchCount, max_pairs);
 }

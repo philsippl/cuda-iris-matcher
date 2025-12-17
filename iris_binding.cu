@@ -7,36 +7,36 @@
 
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
-    const int32_t *dLabels, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags,
+    int r_dim, int theta_dim, const int32_t *dLabels, float match_threshold,
+    float non_match_threshold, bool is_similarity, uint8_t include_flags,
     int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
-    unsigned int *dMatchCount, unsigned int max_pairs,
-    cudaStream_t stream);
+    unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream);
 
 extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_A, const uint32_t *dMask_A, uint32_t *dPremasked_A,
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
-    int M_A, int M_B,
-    const int32_t *dLabels_A, const int32_t *dLabels_B,
-    float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags,
-    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
-    unsigned int *dMatchCount, unsigned int max_pairs,
-    cudaStream_t stream);
+    int M_A, int M_B, int r_dim, int theta_dim, const int32_t *dLabels_A,
+    const int32_t *dLabels_B, float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
+    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
 
-extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M,
-                                             cudaStream_t stream);
+extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M, int r_dim,
+                                             int theta_dim, int d0_dim,
+                                             int d1_dim, cudaStream_t stream);
 
 extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   uint32_t *output, int M,
+                                                  int r_dim, int theta_dim,
+                                                  int d0_dim, int d1_dim,
                                                   cudaStream_t stream);
 
 std::vector<torch::Tensor>
 masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
-                    std::optional<torch::Tensor> labels,
-                    double match_threshold, double non_match_threshold,
-                    bool is_similarity, int64_t include_flags,
-                    int64_t max_pairs) {
+                    std::optional<torch::Tensor> labels, double match_threshold,
+                    double non_match_threshold, bool is_similarity,
+                    int64_t include_flags, int64_t max_pairs, int64_t r_dim,
+                    int64_t theta_dim, int64_t d0_dim, int64_t d1_dim) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kInt, "data dtype must be int32");
@@ -44,8 +44,18 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   TORCH_CHECK(data.is_contiguous() && mask.is_contiguous(),
               "data/mask must be contiguous");
   TORCH_CHECK(data.sizes() == mask.sizes(), "data/mask shape mismatch");
-  TORCH_CHECK(data.dim() == 2 && data.size(1) == K_WORDS,
-              "expected data shape [M, ", K_WORDS, "]");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(data.dim() == 2 && data.size(1) == cfg.k_words,
+              "expected data shape [M, ", cfg.k_words, "] for dims (", r_dim,
+              ", ", theta_dim, ", ", d0_dim, ", ", d1_dim, ")");
 
   int64_t M = data.size(0);
   auto opts_int = data.options();
@@ -55,7 +65,8 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   // Validate labels if provided
   if (labels.has_value()) {
     TORCH_CHECK(labels->is_cuda(), "labels must be CUDA");
-    TORCH_CHECK(labels->scalar_type() == at::kInt, "labels dtype must be int32");
+    TORCH_CHECK(labels->scalar_type() == at::kInt,
+                "labels dtype must be int32");
     TORCH_CHECK(labels->is_contiguous(), "labels must be contiguous");
     TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
                 "labels must have shape [M]");
@@ -94,12 +105,11 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
       reinterpret_cast<uint32_t *>(data.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(mask.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(premasked.data_ptr<int>()), (int)M,
+      (int)r_dim, (int)theta_dim,
       labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
-      (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
-      pair_indices_gpu.data_ptr<int32_t>(),
-      categories_gpu.data_ptr<uint8_t>(),
-      distances_gpu.data_ptr<float>(),
+      (float)match_threshold, (float)non_match_threshold, is_similarity,
+      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
@@ -117,11 +127,14 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   // Only copy the valid entries
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
-                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost,
+                    stream);
     cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
-                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost,
+                    stream);
     cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
-                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost,
+                    stream);
   }
 
   // Return sliced tensors with only valid entries
@@ -132,14 +145,13 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   return {pair_indices_out, categories_out, distances_out, match_count_cpu};
 }
 
-std::vector<torch::Tensor>
-masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
-                       torch::Tensor data_b, torch::Tensor mask_b,
-                       std::optional<torch::Tensor> labels_a,
-                       std::optional<torch::Tensor> labels_b,
-                       double match_threshold, double non_match_threshold,
-                       bool is_similarity, int64_t include_flags,
-                       int64_t max_pairs) {
+std::vector<torch::Tensor> masked_hamming_ab_cuda(
+    torch::Tensor data_a, torch::Tensor mask_a, torch::Tensor data_b,
+    torch::Tensor mask_b, std::optional<torch::Tensor> labels_a,
+    std::optional<torch::Tensor> labels_b, double match_threshold,
+    double non_match_threshold, bool is_similarity, int64_t include_flags,
+    int64_t max_pairs, int64_t r_dim, int64_t theta_dim, int64_t d0_dim,
+    int64_t d1_dim) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(mask_a.is_cuda(), "mask_a must be CUDA");
   TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
@@ -154,10 +166,19 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
               "data_b/mask_b must be contiguous");
   TORCH_CHECK(data_a.sizes() == mask_a.sizes(), "data_a/mask_a shape mismatch");
   TORCH_CHECK(data_b.sizes() == mask_b.sizes(), "data_b/mask_b shape mismatch");
-  TORCH_CHECK(data_a.dim() == 2 && data_a.size(1) == K_WORDS,
-              "expected data_a shape [M_A, ", K_WORDS, "]");
-  TORCH_CHECK(data_b.dim() == 2 && data_b.size(1) == K_WORDS,
-              "expected data_b shape [M_B, ", K_WORDS, "]");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(data_a.dim() == 2 && data_a.size(1) == cfg.k_words,
+              "expected data_a shape [M_A, ", cfg.k_words, "]");
+  TORCH_CHECK(data_b.dim() == 2 && data_b.size(1) == cfg.k_words,
+              "expected data_b shape [M_B, ", cfg.k_words, "]");
 
   int64_t M_A = data_a.size(0);
   int64_t M_B = data_b.size(0);
@@ -168,13 +189,16 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
   // Validate labels if provided (both must be provided or neither)
   bool has_labels = labels_a.has_value() && labels_b.has_value();
   if (labels_a.has_value() || labels_b.has_value()) {
-    TORCH_CHECK(has_labels, "Both labels_a and labels_b must be provided, or neither");
+    TORCH_CHECK(has_labels,
+                "Both labels_a and labels_b must be provided, or neither");
   }
   if (has_labels) {
     TORCH_CHECK(labels_a->is_cuda(), "labels_a must be CUDA");
     TORCH_CHECK(labels_b->is_cuda(), "labels_b must be CUDA");
-    TORCH_CHECK(labels_a->scalar_type() == at::kInt, "labels_a dtype must be int32");
-    TORCH_CHECK(labels_b->scalar_type() == at::kInt, "labels_b dtype must be int32");
+    TORCH_CHECK(labels_a->scalar_type() == at::kInt,
+                "labels_a dtype must be int32");
+    TORCH_CHECK(labels_b->scalar_type() == at::kInt,
+                "labels_b dtype must be int32");
     TORCH_CHECK(labels_a->is_contiguous(), "labels_a must be contiguous");
     TORCH_CHECK(labels_b->is_contiguous(), "labels_b must be contiguous");
     TORCH_CHECK(labels_a->dim() == 1 && labels_a->size(0) == M_A,
@@ -219,15 +243,13 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
       reinterpret_cast<uint32_t *>(premasked_a.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(data_b.data_ptr<int>()),
       reinterpret_cast<uint32_t *>(mask_b.data_ptr<int>()),
-      reinterpret_cast<uint32_t *>(premasked_b.data_ptr<int>()),
-      (int)M_A, (int)M_B,
+      reinterpret_cast<uint32_t *>(premasked_b.data_ptr<int>()), (int)M_A,
+      (int)M_B, (int)r_dim, (int)theta_dim,
       has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
       has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
-      (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
-      pair_indices_gpu.data_ptr<int32_t>(),
-      categories_gpu.data_ptr<uint8_t>(),
-      distances_gpu.data_ptr<float>(),
+      (float)match_threshold, (float)non_match_threshold, is_similarity,
+      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
@@ -245,11 +267,14 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
   // Only copy the valid entries
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
-                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost,
+                    stream);
     cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
-                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost,
+                    stream);
     cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
-                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost,
+                    stream);
   }
 
   // Return sliced tensors with only valid entries
@@ -260,9 +285,11 @@ masked_hamming_ab_cuda(torch::Tensor data_a, torch::Tensor mask_a,
   return {pair_indices_out, categories_out, distances_out, match_count_cpu};
 }
 
-torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
-  // Input: (M, 16, 200, 2, 2) uint8 tensor with values in {0, 1}
-  // Output: (M, 400) int32 tensor (packed bits, theta-major order)
+torch::Tensor pack_theta_major_cuda(torch::Tensor bits, int64_t r_dim,
+                                    int64_t theta_dim, int64_t d0_dim,
+                                    int64_t d1_dim) {
+  // Input: (M, r_dim, theta_dim, d0_dim, d1_dim) uint8 tensor with values in
+  // {0, 1} Output: (M, k_words) int32 tensor (packed bits, theta-major order)
   //
   // IN-PLACE packing with grid-level sync: the kernel packs data into the
   // input buffer. Uses cooperative groups to ensure all reads complete before
@@ -270,33 +297,55 @@ torch::Tensor pack_theta_major_cuda(torch::Tensor bits) {
   TORCH_CHECK(bits.is_cuda(), "bits must be CUDA tensor");
   TORCH_CHECK(bits.scalar_type() == at::kByte, "bits dtype must be uint8");
   TORCH_CHECK(bits.is_contiguous(), "bits must be contiguous");
-  TORCH_CHECK(bits.dim() == 5, "bits must have shape (M, 16, 200, 2, 2)");
-  TORCH_CHECK(bits.size(1) == 16 && bits.size(2) == 200 && bits.size(3) == 2 &&
-                  bits.size(4) == 2,
-              "bits must have shape (M, 16, 200, 2, 2)");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(bits.dim() == 5,
+              "bits must have shape (M, r_dim, theta_dim, d0_dim, d1_dim)");
+  TORCH_CHECK(bits.size(1) == r_dim && bits.size(2) == theta_dim &&
+                  bits.size(3) == d0_dim && bits.size(4) == d1_dim,
+              "bits must have shape (M, ", r_dim, ", ", theta_dim, ", ", d0_dim,
+              ", ", d1_dim, ")");
 
   int64_t M = bits.size(0);
 
   auto stream = at::cuda::getDefaultCUDAStream();
-  launch_pack_theta_major_cuda(bits.data_ptr<uint8_t>(), (int)M, stream);
+  launch_pack_theta_major_cuda(bits.data_ptr<uint8_t>(), (int)M, (int)r_dim,
+                               (int)theta_dim, (int)d0_dim, (int)d1_dim,
+                               stream);
 
-  // Return view of packed data (first M * 400 int32 words)
+  // Return view of packed data (first M * k_words int32 words)
   auto flat = bits.flatten();
-  auto sliced = flat.slice(0, 0, M * K_WORDS * 4);
+  auto sliced = flat.slice(0, 0, M * cfg.k_words * 4);
   auto packed = sliced.view(torch::kInt32);
-  return packed.view({M, K_WORDS});
+  return packed.view({M, cfg.k_words});
 }
 
-torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
-  // Input: (M, 400) int32 tensor packed in r-major order
-  //        bit[r,theta,d0,d1] at linear_bit = r*800 + theta*4 + d0*2 + d1
-  // Output: (M, 400) int32 tensor packed in theta-major order
-  //        bit[r,theta,d0,d1] at linear_bit = theta*64 + r*4 + d0*2 + d1
+torch::Tensor repack_to_theta_major_cuda(torch::Tensor input, int64_t r_dim,
+                                         int64_t theta_dim, int64_t d0_dim,
+                                         int64_t d1_dim) {
+  // Input: (M, k_words) int32 tensor packed in r-major order
+  // Output: (M, k_words) int32 tensor packed in theta-major order
   TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(input.scalar_type() == at::kInt, "input dtype must be int32");
   TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-  TORCH_CHECK(input.dim() == 2 && input.size(1) == K_WORDS,
-              "input must have shape (M, ", K_WORDS, ")");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(input.dim() == 2 && input.size(1) == cfg.k_words,
+              "input must have shape (M, ", cfg.k_words, ")");
 
   int64_t M = input.size(0);
   auto output = torch::empty_like(input);
@@ -304,36 +353,43 @@ torch::Tensor repack_to_theta_major_cuda(torch::Tensor input) {
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_repack_to_theta_major_cuda(
       reinterpret_cast<const uint32_t *>(input.data_ptr<int>()),
-      reinterpret_cast<uint32_t *>(output.data_ptr<int>()), (int)M, stream);
+      reinterpret_cast<uint32_t *>(output.data_ptr<int>()), (int)M, (int)r_dim,
+      (int)theta_dim, (int)d0_dim, (int)d1_dim, stream);
 
   return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("masked_hamming_cuda", &masked_hamming_cuda,
-        "Masked hamming distance with classification (CUDA)",
-        py::arg("data"), py::arg("mask"),
-        py::arg("labels") = py::none(),
+        "Masked hamming distance with classification (CUDA)", py::arg("data"),
+        py::arg("mask"), py::arg("labels") = py::none(),
         py::arg("match_threshold") = 0.35,
-        py::arg("non_match_threshold") = 0.35,
-        py::arg("is_similarity") = false,
-        py::arg("include_flags") = INCLUDE_ALL,
-        py::arg("max_pairs") = 1000000);
+        py::arg("non_match_threshold") = 0.35, py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
+        py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
   m.def("masked_hamming_ab_cuda", &masked_hamming_ab_cuda,
-        "Masked hamming distance between two sets A and B with classification (CUDA)",
-        py::arg("data_a"), py::arg("mask_a"),
-        py::arg("data_b"), py::arg("mask_b"),
-        py::arg("labels_a") = py::none(),
-        py::arg("labels_b") = py::none(),
-        py::arg("match_threshold") = 0.35,
-        py::arg("non_match_threshold") = 0.35,
-        py::arg("is_similarity") = false,
-        py::arg("include_flags") = INCLUDE_ALL,
-        py::arg("max_pairs") = 1000000);
+        "Masked hamming distance between two sets A and B with classification "
+        "(CUDA)",
+        py::arg("data_a"), py::arg("mask_a"), py::arg("data_b"),
+        py::arg("mask_b"), py::arg("labels_a") = py::none(),
+        py::arg("labels_b") = py::none(), py::arg("match_threshold") = 0.35,
+        py::arg("non_match_threshold") = 0.35, py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
+        py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
   m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
-        "Pack iris bits to theta-major int32 words (CUDA)");
+        "Pack iris bits to theta-major int32 words (CUDA)", py::arg("bits"),
+        py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
   m.def("repack_to_theta_major_cuda", &repack_to_theta_major_cuda,
-        "Repack int32 words from r-major to theta-major order (CUDA)");
+        "Repack int32 words from r-major to theta-major order (CUDA)",
+        py::arg("input"), py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
 
   // Export classification constants
   m.attr("CATEGORY_TRUE_MATCH") = py::int_(CATEGORY_TRUE_MATCH);
@@ -345,4 +401,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("INCLUDE_FNM") = py::int_(INCLUDE_FNM);
   m.attr("INCLUDE_TNM") = py::int_(INCLUDE_TNM);
   m.attr("INCLUDE_ALL") = py::int_(INCLUDE_ALL);
+
+  // Export default dimensions
+  m.attr("DEFAULT_R_DIM") = py::int_(DEFAULT_R_DIM);
+  m.attr("DEFAULT_THETA_DIM") = py::int_(DEFAULT_THETA_DIM);
+  m.attr("DEFAULT_D0_DIM") = py::int_(DEFAULT_D0_DIM);
+  m.attr("DEFAULT_D1_DIM") = py::int_(DEFAULT_D1_DIM);
 }

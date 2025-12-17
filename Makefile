@@ -1,6 +1,14 @@
 NVCC ?= nvcc
 NVCCFLAGS ?= -O3 -arch=sm_89
 
+# Iris dimensions (override with: make IR_R_DIM=8 IR_THETA_DIM=128)
+ifdef IR_R_DIM
+NVCCFLAGS += -DIR_R_DIM=$(IR_R_DIM)
+endif
+ifdef IR_THETA_DIM
+NVCCFLAGS += -DIR_THETA_DIM=$(IR_THETA_DIM)
+endif
+
 # Main library object
 SRCS := iris.cu
 OBJS := iris.o iris_fallback.o
@@ -66,5 +74,24 @@ test-fallback:
 	FORCE_FALLBACK=1 pip install -e . --no-build-isolation -q
 	python -m pytest tests/python_tests/ -v
 
-.PHONY: all run quick bench both compare clean test test-tc test-fallback
+# Python benchmark targets
+pybench: pybench-install
+	python benchmarking/benchmark.py
+
+pybench-install:
+	pip install -e . --no-build-isolation -q
+
+# Quick Python benchmark (small sizes)
+pybench-quick: pybench-install
+	python benchmarking/benchmark.py --sizes 256,512,1024 --warmup 2 --repeats 3
+
+# Full Python benchmark (all sizes)
+pybench-full: pybench-install
+	python benchmarking/benchmark.py --sizes 256,512,1024,2048,4096,8192,16384 --warmup 3 --repeats 5
+
+# Python benchmark with JSON output
+pybench-json: pybench-install
+	python benchmarking/benchmark.py --json
+
+.PHONY: all run quick bench both compare clean test test-tc test-fallback pybench pybench-install pybench-quick pybench-full pybench-json
 
