@@ -39,6 +39,66 @@ def _resolve_dims(
     return (r_dim, theta_dim, d0_dim, d1_dim)
 
 
+def _is_packed(tensor: torch.Tensor, k_words: int) -> bool:
+    """Check if tensor is already packed (int32, shape [M, k_words])."""
+    return (
+        tensor.dim() == 2
+        and tensor.size(1) == k_words
+        and tensor.dtype == torch.int32
+    )
+
+
+def _is_unpacked(
+    tensor: torch.Tensor, r_dim: int, theta_dim: int, d0_dim: int, d1_dim: int
+) -> bool:
+    """Check if tensor is unpacked (uint8, shape [M, r, theta, d0, d1])."""
+    return (
+        tensor.dim() == 5
+        and tensor.size(1) == r_dim
+        and tensor.size(2) == theta_dim
+        and tensor.size(3) == d0_dim
+        and tensor.size(4) == d1_dim
+        and tensor.dtype == torch.uint8
+    )
+
+
+def _ensure_packed(
+    tensor: torch.Tensor,
+    r_dim: int,
+    theta_dim: int,
+    d0_dim: int,
+    d1_dim: int,
+) -> torch.Tensor:
+    """Ensure tensor is packed on GPU. Packs if needed, moves to GPU if needed.
+    
+    Args:
+        tensor: Either packed [M, k_words] int32 or unpacked [M, r, theta, d0, d1] uint8
+        
+    Returns:
+        Packed tensor on CUDA, shape [M, k_words] int32
+    """
+    k_words = r_dim * theta_dim * d0_dim * d1_dim // 32
+    
+    if _is_packed(tensor, k_words):
+        # Already packed, just ensure on GPU
+        if tensor.is_cuda:
+            return tensor
+        return tensor.cuda()
+    
+    if _is_unpacked(tensor, r_dim, theta_dim, d0_dim, d1_dim):
+        # Need to pack - move to GPU first if needed
+        if not tensor.is_cuda:
+            tensor = tensor.cuda()
+        # Clone because pack_theta_major is in-place
+        return _C.pack_theta_major_cuda(tensor.clone(), r_dim, theta_dim, d0_dim, d1_dim)
+    
+    raise ValueError(
+        f"Invalid tensor shape. Expected packed [M, {k_words}] int32 or "
+        f"unpacked [M, {r_dim}, {theta_dim}, {d0_dim}, {d1_dim}] uint8, "
+        f"got shape {list(tensor.shape)} dtype {tensor.dtype}"
+    )
+
+
 def masked_hamming_cuda(
     data: torch.Tensor,
     mask: torch.Tensor,
@@ -58,10 +118,13 @@ def masked_hamming_cuda(
     Compute minimum fractional hamming distance for all pairs within a single set.
     Only the lower triangle (i > j) is computed.
 
+    Accepts either packed or unpacked data - packing is done on GPU automatically.
+
     Args:
-        data: CUDA int32 contiguous tensor of shape [M, k_words] (packed iris codes)
-              where k_words = r_dim * theta_dim * d0_dim * d1_dim / 32
-        mask: CUDA int32 contiguous tensor of shape [M, k_words] (packed masks)
+        data: Tensor of shape [M, k_words] int32 (packed) OR
+              [M, r_dim, theta_dim, d0_dim, d1_dim] uint8 (unpacked).
+              If unpacked, will be packed on GPU automatically.
+        mask: Same shape/dtype as data
         labels: Optional CUDA int32 tensor of shape [M] with identity labels.
                 If None, no classification is performed and all pairs are returned.
         match_threshold: Threshold for match classification (default: 0.35)
@@ -90,6 +153,11 @@ def masked_hamming_cuda(
         Synchronization is handled internally.
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
+    
+    # Auto-pack if unpacked data is provided
+    data = _ensure_packed(data, r_dim, theta_dim, d0_dim, d1_dim)
+    mask = _ensure_packed(mask, r_dim, theta_dim, d0_dim, d1_dim)
+    
     return _C.masked_hamming_cuda(
         data, mask, labels,
         match_threshold, non_match_threshold,
@@ -120,12 +188,15 @@ def masked_hamming_ab_cuda(
     Compute minimum fractional hamming distance between two different sets A and B.
     Computes the full M_A x M_B matrix (not just lower triangle).
 
+    Accepts either packed or unpacked data - packing is done on GPU automatically.
+
     Args:
-        data_a: CUDA int32 contiguous tensor of shape [M_A, k_words] (packed iris codes)
-        mask_a: CUDA int32 contiguous tensor of shape [M_A, k_words] (packed masks)
-        data_b: CUDA int32 contiguous tensor of shape [M_B, k_words] (packed iris codes)
-        mask_b: CUDA int32 contiguous tensor of shape [M_B, k_words] (packed masks)
-              where k_words = r_dim * theta_dim * d0_dim * d1_dim / 32
+        data_a: Tensor of shape [M_A, k_words] int32 (packed) OR
+                [M_A, r_dim, theta_dim, d0_dim, d1_dim] uint8 (unpacked)
+        mask_a: Same shape/dtype as data_a
+        data_b: Tensor of shape [M_B, k_words] int32 (packed) OR
+                [M_B, r_dim, theta_dim, d0_dim, d1_dim] uint8 (unpacked)
+        mask_b: Same shape/dtype as data_b
         labels_a: Optional CUDA int32 tensor of shape [M_A] with identity labels.
         labels_b: Optional CUDA int32 tensor of shape [M_B] with identity labels.
                   Both labels_a and labels_b must be provided, or neither.
@@ -156,6 +227,13 @@ def masked_hamming_ab_cuda(
         Synchronization is handled internally.
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
+    
+    # Auto-pack if unpacked data is provided
+    data_a = _ensure_packed(data_a, r_dim, theta_dim, d0_dim, d1_dim)
+    mask_a = _ensure_packed(mask_a, r_dim, theta_dim, d0_dim, d1_dim)
+    data_b = _ensure_packed(data_b, r_dim, theta_dim, d0_dim, d1_dim)
+    mask_b = _ensure_packed(mask_b, r_dim, theta_dim, d0_dim, d1_dim)
+    
     return _C.masked_hamming_ab_cuda(
         data_a, mask_a, data_b, mask_b,
         labels_a, labels_b,
