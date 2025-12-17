@@ -838,6 +838,25 @@ extern "C" void launch_masked_hamming_cuda(
       2 * (2 * BLOCK_M * K_CHUNK_WORDS + 2 * BLOCK_N * K_CHUNK_WORDS_EXT) *
       sizeof(uint32_t);
 
+  // Opt-in to maximum dynamic shared memory (if supported) so larger BLOCK_M/N
+  // configs can launch without silently failing due to the default 48KiB cap.
+  // We intentionally don't hard-fail if this is unsupported on a device.
+  static int s_optin_bytes = -2; // -2=uninitialized
+  if (s_optin_bytes == -2) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               0) == cudaSuccess) {
+      s_optin_bytes = v;
+    } else {
+      s_optin_bytes = -1;
+    }
+  }
+  if (s_optin_bytes > 0) {
+    (void)cudaFuncSetAttribute(min_hamming_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               s_optin_bytes);
+  }
+
   min_hamming_kernel<<<grid, block, smem, stream>>>(
       dPremasked, dMask, M, dLabels, match_threshold, non_match_threshold,
       is_similarity, include_flags, dPairIndices, dCategories, dOutDistances,
@@ -1243,6 +1262,24 @@ extern "C" void launch_masked_hamming_ab_cuda(
   size_t smem =
       2 * (2 * BLOCK_M * K_CHUNK_WORDS + 2 * BLOCK_N * K_CHUNK_WORDS_EXT) *
       sizeof(uint32_t);
+
+  // Opt-in to maximum dynamic shared memory (if supported) so larger BLOCK_M/N
+  // configs can launch without silently failing due to the default 48KiB cap.
+  static int s_optin_bytes_ab = -2; // -2=uninitialized
+  if (s_optin_bytes_ab == -2) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               0) == cudaSuccess) {
+      s_optin_bytes_ab = v;
+    } else {
+      s_optin_bytes_ab = -1;
+    }
+  }
+  if (s_optin_bytes_ab > 0) {
+    (void)cudaFuncSetAttribute(min_hamming_ab_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               s_optin_bytes_ab);
+  }
 
   min_hamming_ab_kernel<<<grid, block, smem, stream>>>(
       dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, dLabels_A,
