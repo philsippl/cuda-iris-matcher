@@ -675,6 +675,18 @@ def masked_hamming_sharded(
         else:
             mask_gpu = _pack_on_device(mask, primary_device, r_dim, theta_dim, d0_dim, d1_dim)
 
+    # For single GPU without forced sharding, use non-sharded kernel directly
+    # (sharding adds overhead without benefit on single GPU)
+    if num_devices == 1 and min_shards <= 1:
+        labels_gpu = None
+        if labels is not None:
+            labels_gpu = labels.cuda(primary_device) if not labels.is_cuda else labels
+        return _C.masked_hamming_cuda(
+            data_gpu, mask_gpu, labels_gpu,
+            match_threshold, non_match_threshold, is_similarity,
+            include_flags, max_pairs, r_dim, theta_dim, d0_dim, d1_dim
+        )
+
     # Compute shard configurations for lower triangle
     shards = _compute_self_shard_configs(
         m, k_words, max_pairs, num_devices, min_shards, max_tile_size
@@ -709,35 +721,48 @@ def masked_hamming_sharded(
                     shard.device_id
                 )
 
-            # For diagonal tiles (a_start == b_start), we'll filter to lower triangle later
-            # so we need to request more pairs from the kernel (roughly 2x for diagonal)
             is_diagonal = shard.a_start == shard.b_start
-            if is_diagonal:
-                # Diagonal tile: request 2x max_pairs since ~half will be filtered out
-                # Cap at a reasonable limit to avoid blowing up memory/time
-                tile_max_pairs = min(max_pairs_per_shard * 2, 100_000)
-            else:
-                # Off-diagonal lower triangle tile: all pairs are valid
-                tile_max_pairs = max_pairs_per_shard
 
-            # Run A vs B kernel
-            indices, categories, distances, count = _C.masked_hamming_ab_cuda(
-                data_a_tile,
-                mask_a_tile,
-                data_b_tile,
-                mask_b_tile,
-                labels_a_tile,
-                labels_b_tile,
-                match_threshold,
-                non_match_threshold,
-                is_similarity,
-                include_flags,
-                tile_max_pairs,
-                r_dim,
-                theta_dim,
-                d0_dim,
-                d1_dim,
-            )
+            if is_diagonal:
+                # Diagonal tile: use native self-comparison kernel (computes lower triangle only)
+                # This is 2x faster than A vs B kernel + filtering
+                labels_tile = None
+                if labels_cpu is not None:
+                    labels_tile = labels_cpu[shard.a_start : shard.a_end].cuda(shard.device_id)
+
+                indices, categories, distances, count = _C.masked_hamming_cuda(
+                    data_a_tile,
+                    mask_a_tile,
+                    labels_tile,
+                    match_threshold,
+                    non_match_threshold,
+                    is_similarity,
+                    include_flags,
+                    max_pairs_per_shard,
+                    r_dim,
+                    theta_dim,
+                    d0_dim,
+                    d1_dim,
+                )
+            else:
+                # Off-diagonal tile: use A vs B kernel (all pairs are in lower triangle)
+                indices, categories, distances, count = _C.masked_hamming_ab_cuda(
+                    data_a_tile,
+                    mask_a_tile,
+                    data_b_tile,
+                    mask_b_tile,
+                    labels_a_tile,
+                    labels_b_tile,
+                    match_threshold,
+                    non_match_threshold,
+                    is_similarity,
+                    include_flags,
+                    max_pairs_per_shard,
+                    r_dim,
+                    theta_dim,
+                    d0_dim,
+                    d1_dim,
+                )
 
             n = count.item()
             if n > 0:
@@ -749,23 +774,12 @@ def masked_hamming_sharded(
                 categories_cpu = categories[:n].cpu()
                 distances_cpu = distances[:n].cpu()
 
-                # Filter to lower triangle: global_row > global_col
-                # This is needed for diagonal tiles where a_start == b_start
-                if is_diagonal:
-                    valid_mask = indices_cpu[:, 0] > indices_cpu[:, 1]
-                    # Use nonzero + index_select for fast filtering (avoids slow bool indexing)
-                    valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
-                    indices_cpu = torch.index_select(indices_cpu, 0, valid_indices)
-                    categories_cpu = torch.index_select(categories_cpu, 0, valid_indices)
-                    distances_cpu = torch.index_select(distances_cpu, 0, valid_indices)
-
-                if indices_cpu.size(0) > 0:
-                    return ShardResult(
-                        indices=indices_cpu,
-                        categories=categories_cpu,
-                        distances=distances_cpu,
-                        count=indices_cpu.size(0),
-                    )
+                return ShardResult(
+                    indices=indices_cpu,
+                    categories=categories_cpu,
+                    distances=distances_cpu,
+                    count=n,
+                )
             return None
 
     # Run shards concurrently across devices
