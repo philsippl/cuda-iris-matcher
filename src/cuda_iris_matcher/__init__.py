@@ -27,6 +27,8 @@ from .sharding import (
     pack_theta_major_batched,
     get_device_count,
     get_shard_info,
+    get_self_shard_info,
+    get_total_shards,
     ShardConfig,
 )
 
@@ -35,12 +37,14 @@ __all__ = [
     "masked_hamming_ab_cuda",
     "pack_theta_major",
     "repack_to_theta_major",
-    # Sharded versions (multi-GPU / large dataset support)
+    # Sharded versions (multi-GPU / multi-host / large dataset support)
     "masked_hamming_sharded",
     "masked_hamming_ab_sharded",
     "pack_theta_major_batched",
     "get_device_count",
     "get_shard_info",
+    "get_self_shard_info",
+    "get_total_shards",
     "ShardConfig",
     # Classification constants
     "CATEGORY_TRUE_MATCH",

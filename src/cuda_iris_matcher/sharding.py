@@ -31,11 +31,12 @@ from .ops import (
 class ShardConfig:
     """Configuration for a single shard of computation."""
 
-    device_id: int  # CUDA device ID
+    device_id: int  # CUDA device ID (local to this host)
     a_start: int  # Start index in A
     a_end: int  # End index in A (exclusive)
     b_start: int  # Start index in B
     b_end: int  # End index in B (exclusive)
+    global_shard_id: int = 0  # Global shard ID across all hosts (for deterministic mapping)
 
 
 @dataclass
@@ -57,6 +58,47 @@ class ShardKernelResult:
     categories: torch.Tensor  # On GPU
     distances: torch.Tensor  # On GPU
     count: torch.Tensor  # On GPU
+
+
+def _filter_shards_for_host(
+    shards: List[ShardConfig],
+    host_index: int,
+    num_hosts: int,
+    num_devices_per_host: int,
+) -> List[ShardConfig]:
+    """Filter shards to only those assigned to this host and remap device IDs.
+
+    Shards are assigned to hosts in a round-robin fashion based on global_shard_id.
+    Device IDs are remapped to be local to this host (0 to num_devices_per_host-1).
+
+    Args:
+        shards: List of all shard configurations (with global_shard_id set)
+        host_index: Index of this host (0 to num_hosts-1)
+        num_hosts: Total number of hosts
+        num_devices_per_host: Number of CUDA devices on this host
+
+    Returns:
+        Filtered list of shards for this host with local device IDs
+    """
+    if num_hosts <= 1:
+        return shards
+
+    filtered = []
+    for shard in shards:
+        if shard.global_shard_id % num_hosts == host_index:
+            # Remap device_id to be local to this host
+            local_device_id = (shard.global_shard_id // num_hosts) % num_devices_per_host
+            filtered.append(
+                ShardConfig(
+                    device_id=local_device_id,
+                    a_start=shard.a_start,
+                    a_end=shard.a_end,
+                    b_start=shard.b_start,
+                    b_end=shard.b_end,
+                    global_shard_id=shard.global_shard_id,
+                )
+            )
+    return filtered
 
 
 def _run_shards_concurrent(
@@ -441,7 +483,7 @@ def _compute_shard_configs(
     tile_size_b = math.ceil(m_b / n_tiles_b)
 
     # Generate shard configs, distributing across devices
-    device_idx = 0
+    global_shard_idx = 0
     for i in range(n_tiles_a):
         a_start = i * tile_size_a
         a_end = min((i + 1) * tile_size_a, m_a)
@@ -456,14 +498,15 @@ def _compute_shard_configs(
 
             shards.append(
                 ShardConfig(
-                    device_id=device_idx % num_devices if num_devices > 0 else 0,
+                    device_id=global_shard_idx % num_devices if num_devices > 0 else 0,
                     a_start=a_start,
                     a_end=a_end,
                     b_start=b_start,
                     b_end=b_end,
+                    global_shard_id=global_shard_idx,
                 )
             )
-            device_idx += 1
+            global_shard_idx += 1
 
     return shards
 
@@ -561,8 +604,8 @@ def _compute_self_shard_configs(
     if num_devices <= 0 or num_devices == 1:
         # Single device - no balancing needed
         return [
-            ShardConfig(device_id=0, a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3])
-            for t in tiles_with_work
+            ShardConfig(device_id=0, a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=i)
+            for i, t in enumerate(tiles_with_work)
         ]
 
     # Greedy load balancing: assign largest tiles first to least loaded GPU
@@ -571,18 +614,18 @@ def _compute_self_shard_configs(
 
     # Track work per device
     device_work = [0] * num_devices
-    tile_assignments: List[Tuple[int, int, int, int, int, int]] = []  # + device_id
+    tile_assignments: List[Tuple[int, int, int, int, int, int, int]] = []  # + device_id, global_id
 
-    for a_start, a_end, b_start, b_end, work in tiles_with_work:
+    for idx, (a_start, a_end, b_start, b_end, work) in enumerate(tiles_with_work):
         # Assign to GPU with least work
         min_device = min(range(num_devices), key=lambda d: device_work[d])
         device_work[min_device] += work
-        tile_assignments.append((a_start, a_end, b_start, b_end, work, min_device))
+        tile_assignments.append((a_start, a_end, b_start, b_end, work, min_device, idx))
 
     # Create shard configs (sorted by device for better locality)
     tile_assignments.sort(key=lambda x: (x[5], x[0], x[2]))  # Sort by device, then position
     shards = [
-        ShardConfig(device_id=t[5], a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3])
+        ShardConfig(device_id=t[5], a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=t[6])
         for t in tile_assignments
     ]
 
@@ -608,12 +651,21 @@ def masked_hamming_ab_sharded(
     d1_dim: int = DEFAULT_D1_DIM,
     min_shards: int = 1,
     max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sharded version of masked_hamming_ab_cuda for multi-GPU and large datasets.
+    """Sharded version of masked_hamming_ab_cuda for multi-GPU and multi-host datasets.
 
     Automatically distributes computation across all available CUDA devices and
     handles cases where A or B don't fit on a single device. Accepts either
     packed (int32) or unpacked (uint8) data - packing is done on GPU automatically.
+
+    For multi-host operation:
+    - Each host should have the FULL data tensors (or be able to access all rows)
+    - Set host_index to this host's index (0 to num_hosts-1)
+    - Set num_hosts to total number of hosts
+    - Each host will process only its assigned tiles
+    - Results from all hosts should be aggregated by the caller
 
     Args:
         data_a: Tensor of shape [M_A, k_words] int32 (packed) OR
@@ -633,6 +685,8 @@ def masked_hamming_ab_sharded(
         r_dim, theta_dim, d0_dim, d1_dim: Iris code dimensions
         min_shards: Minimum number of shards (useful for testing on single GPU)
         max_tile_size: Maximum rows per tile (None = auto based on memory)
+        host_index: Index of this host for multi-host operation (default: 0)
+        num_hosts: Total number of hosts for multi-host operation (default: 1)
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -694,10 +748,25 @@ def masked_hamming_ab_sharded(
         )
 
     # Compute shard configurations
-    shards = _compute_shard_configs(
-        m_a, m_b, k_words, max_pairs, num_devices, min_shards, max_tile_size
+    # For multi-host, compute shards as if all hosts' GPUs were available
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_shard_configs(
+        m_a, m_b, k_words, max_pairs, total_devices, min_shards * num_hosts, max_tile_size
     )
-    max_pairs_per_shard = max(max_pairs // max(1, len(shards)), 1000)
+
+    # Filter to only shards assigned to this host
+    shards = _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+    # If no shards assigned to this host, return empty results
+    if len(shards) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    max_pairs_per_shard = max(max_pairs // max(1, len(all_shards)), 1000)
 
     # For labels, keep on CPU for now (small)
     labels_a_cpu = labels_a.cpu() if labels_a is not None and labels_a.is_cuda else labels_a
@@ -869,11 +938,20 @@ def masked_hamming_sharded(
     d1_dim: int = DEFAULT_D1_DIM,
     min_shards: int = 1,
     max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sharded version of masked_hamming_cuda for multi-GPU and large datasets.
+    """Sharded version of masked_hamming_cuda for multi-GPU and multi-host datasets.
 
     Computes the lower triangle (i > j) by tiling and distributing across devices.
     Accepts either packed (int32) or unpacked (uint8) data - packing is done on GPU.
+
+    For multi-host operation:
+    - Each host should have the FULL data tensor (or be able to access all rows)
+    - Set host_index to this host's index (0 to num_hosts-1)
+    - Set num_hosts to total number of hosts
+    - Each host will process only its assigned tiles
+    - Results from all hosts should be aggregated by the caller
 
     Args:
         data: Tensor of shape [M, k_words] int32 (packed) OR
@@ -889,6 +967,8 @@ def masked_hamming_sharded(
         r_dim, theta_dim, d0_dim, d1_dim: Iris code dimensions
         min_shards: Minimum number of shards (useful for testing on single GPU)
         max_tile_size: Maximum rows per tile (None = auto based on memory)
+        host_index: Index of this host for multi-host operation (default: 0)
+        num_hosts: Total number of hosts for multi-host operation (default: 1)
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -935,10 +1015,25 @@ def masked_hamming_sharded(
         )
 
     # Compute shard configurations for lower triangle
-    shards = _compute_self_shard_configs(
-        m, k_words, max_pairs, num_devices, min_shards, max_tile_size
+    # For multi-host, compute shards as if all hosts' GPUs were available
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_self_shard_configs(
+        m, k_words, max_pairs, total_devices, min_shards * num_hosts, max_tile_size
     )
-    max_pairs_per_shard = max(max_pairs // max(1, len(shards)), 1000)
+
+    # Filter to only shards assigned to this host
+    shards = _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+    # If no shards assigned to this host, return empty results
+    if len(shards) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    max_pairs_per_shard = max(max_pairs // max(1, len(all_shards)), 1000)
 
     # Labels stay on CPU (small)
     labels_cpu = labels.cpu() if labels is not None and labels.is_cuda else labels
@@ -1200,6 +1295,8 @@ def get_shard_info(
     max_pairs_per_shard: int = 100000,
     min_shards: int = 1,
     max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
 ) -> List[ShardConfig]:
     """Get shard configuration info for planning (debugging/inspection).
 
@@ -1210,12 +1307,88 @@ def get_shard_info(
         max_pairs_per_shard: Max pairs per shard
         min_shards: Minimum number of shards
         max_tile_size: Maximum tile size
+        host_index: Index of this host for multi-host operation (default: 0)
+        num_hosts: Total number of hosts for multi-host operation (default: 1)
 
     Returns:
-        List of ShardConfig objects
+        List of ShardConfig objects for this host
     """
     num_devices = torch.cuda.device_count()
-    return _compute_shard_configs(
-        m_a, m_b, k_words, max_pairs_per_shard, num_devices, min_shards, max_tile_size
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_shard_configs(
+        m_a, m_b, k_words, max_pairs_per_shard, total_devices, min_shards * num_hosts, max_tile_size
     )
+    return _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+
+def get_self_shard_info(
+    m: int,
+    k_words: int = 400,
+    max_pairs_per_shard: int = 100000,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
+) -> List[ShardConfig]:
+    """Get shard configuration info for self-comparison (lower triangle).
+
+    Args:
+        m: Number of rows
+        k_words: Number of int32 words per row (default 400 for standard iris)
+        max_pairs_per_shard: Max pairs per shard
+        min_shards: Minimum number of shards
+        max_tile_size: Maximum tile size
+        host_index: Index of this host for multi-host operation (default: 0)
+        num_hosts: Total number of hosts for multi-host operation (default: 1)
+
+    Returns:
+        List of ShardConfig objects for this host
+    """
+    num_devices = torch.cuda.device_count()
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_self_shard_configs(
+        m, k_words, max_pairs_per_shard, total_devices, min_shards * num_hosts, max_tile_size
+    )
+    return _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+
+def get_total_shards(
+    m_a: int,
+    m_b: Optional[int] = None,
+    k_words: int = 400,
+    max_pairs_per_shard: int = 100000,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+    num_hosts: int = 1,
+) -> int:
+    """Get total number of shards across all hosts.
+
+    Useful for determining how work will be distributed before launching.
+
+    Args:
+        m_a: Number of rows in A (or total rows for self-comparison)
+        m_b: Number of rows in B (None for self-comparison)
+        k_words: Number of int32 words per row (default 400 for standard iris)
+        max_pairs_per_shard: Max pairs per shard
+        min_shards: Minimum number of shards per host
+        max_tile_size: Maximum tile size
+        num_hosts: Total number of hosts
+
+    Returns:
+        Total number of shards
+    """
+    num_devices = torch.cuda.device_count()
+    total_devices = num_devices * num_hosts
+
+    if m_b is None:
+        # Self-comparison
+        shards = _compute_self_shard_configs(
+            m_a, k_words, max_pairs_per_shard, total_devices, min_shards * num_hosts, max_tile_size
+        )
+    else:
+        # A vs B comparison
+        shards = _compute_shard_configs(
+            m_a, m_b, k_words, max_pairs_per_shard, total_devices, min_shards * num_hosts, max_tile_size
+        )
+    return len(shards)
 

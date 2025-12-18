@@ -841,3 +841,222 @@ class TestAutoPackingNonSharded:
         np.testing.assert_array_equal(idx1[order1], idx2[order2], "Indices differ")
         np.testing.assert_allclose(dist1_np[order1], dist2_np[order2], err_msg="Distances differ")
 
+
+class TestMultiHostSharding:
+    """Tests for multi-host sharding support."""
+
+    def test_shard_distribution_across_hosts(self):
+        """Verify shards are evenly distributed across hosts."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        M = 1000
+        num_hosts = 3
+
+        # Get shards for each host
+        all_global_ids = set()
+        for host_idx in range(num_hosts):
+            shards = ih.get_self_shard_info(
+                m=M, min_shards=6, host_index=host_idx, num_hosts=num_hosts
+            )
+            # Check no duplicate global IDs
+            for s in shards:
+                assert s.global_shard_id not in all_global_ids, \
+                    f"Duplicate global_shard_id {s.global_shard_id}"
+                all_global_ids.add(s.global_shard_id)
+                # Check device ID is valid for local host
+                assert 0 <= s.device_id < torch.cuda.device_count(), \
+                    f"Invalid device_id {s.device_id}"
+
+        # Verify total shards matches expected
+        total = ih.get_total_shards(m_a=M, num_hosts=num_hosts, min_shards=6)
+        assert len(all_global_ids) == total, \
+            f"Collected {len(all_global_ids)} shards but expected {total}"
+
+    def test_multi_host_self_results_combine(self):
+        """Verify multi-host self-comparison results combine correctly."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        M = 200  # Smaller for faster test
+        num_hosts = 2
+        # Use very high max_pairs to avoid per-shard limits affecting results
+        max_pairs = 1000000
+
+        # Generate test data
+        data = torch.randint(0, 2**31, (M, 400), dtype=torch.int32)
+        mask = torch.full((M, 400), 0x7FFFFFFF, dtype=torch.int32)
+
+        # Run single-host version (baseline) - use same min_shards*num_hosts
+        # to get same tiling as multi-host
+        idx_single, cat_single, dist_single, cnt_single = ih.masked_hamming_sharded(
+            data, mask, max_pairs=max_pairs, min_shards=4 * num_hosts
+        )
+        n_single = cnt_single.item()
+
+        # Run multi-host version and combine
+        all_indices = []
+        all_distances = []
+        total_count = 0
+        for host_idx in range(num_hosts):
+            idx, cat, dist, cnt = ih.masked_hamming_sharded(
+                data, mask,
+                max_pairs=max_pairs,
+                min_shards=4,
+                host_index=host_idx,
+                num_hosts=num_hosts
+            )
+            n = cnt.item()
+            if n > 0:
+                all_indices.append(idx[:n])
+                all_distances.append(dist[:n])
+                total_count += n
+
+        # Combined count should match single-host count
+        assert total_count == n_single, \
+            f"Multi-host total {total_count} != single-host {n_single}"
+
+        # Combined results should have same pairs
+        if n_single > 0:
+            combined_indices = torch.cat(all_indices, dim=0)
+            combined_distances = torch.cat(all_distances, dim=0)
+
+            # Sort both by (row, col) for comparison
+            single_order = torch.argsort(
+                idx_single[:n_single, 0] * M + idx_single[:n_single, 1]
+            )
+            combined_order = torch.argsort(
+                combined_indices[:, 0] * M + combined_indices[:, 1]
+            )
+
+            torch.testing.assert_close(
+                idx_single[:n_single][single_order],
+                combined_indices[combined_order],
+                msg="Indices differ between single-host and multi-host"
+            )
+            torch.testing.assert_close(
+                dist_single[:n_single][single_order],
+                combined_distances[combined_order],
+                msg="Distances differ between single-host and multi-host"
+            )
+
+    def test_multi_host_ab_results_combine(self):
+        """Verify multi-host AB comparison results combine correctly."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        M_A, M_B = 300, 200
+        num_hosts = 2
+
+        # Generate test data
+        data_a = torch.randint(0, 2**31, (M_A, 400), dtype=torch.int32)
+        mask_a = torch.full((M_A, 400), 0x7FFFFFFF, dtype=torch.int32)
+        data_b = torch.randint(0, 2**31, (M_B, 400), dtype=torch.int32)
+        mask_b = torch.full((M_B, 400), 0x7FFFFFFF, dtype=torch.int32)
+
+        # Run single-host version (baseline)
+        idx_single, cat_single, dist_single, cnt_single = ih.masked_hamming_ab_sharded(
+            data_a, mask_a, data_b, mask_b, max_pairs=100000, min_shards=4
+        )
+        n_single = cnt_single.item()
+
+        # Run multi-host version and combine
+        all_indices = []
+        all_distances = []
+        total_count = 0
+        for host_idx in range(num_hosts):
+            idx, cat, dist, cnt = ih.masked_hamming_ab_sharded(
+                data_a, mask_a, data_b, mask_b,
+                max_pairs=100000,
+                min_shards=4,
+                host_index=host_idx,
+                num_hosts=num_hosts
+            )
+            n = cnt.item()
+            if n > 0:
+                all_indices.append(idx[:n])
+                all_distances.append(dist[:n])
+                total_count += n
+
+        # Combined count should match single-host count
+        assert total_count == n_single, \
+            f"Multi-host total {total_count} != single-host {n_single}"
+
+        # Combined results should have same pairs
+        if n_single > 0:
+            combined_indices = torch.cat(all_indices, dim=0)
+            combined_distances = torch.cat(all_distances, dim=0)
+
+            # Sort both by (row_a, row_b) for comparison
+            single_order = torch.argsort(
+                idx_single[:n_single, 0] * M_B + idx_single[:n_single, 1]
+            )
+            combined_order = torch.argsort(
+                combined_indices[:, 0] * M_B + combined_indices[:, 1]
+            )
+
+            torch.testing.assert_close(
+                idx_single[:n_single][single_order],
+                combined_indices[combined_order],
+                msg="Indices differ between single-host and multi-host"
+            )
+            torch.testing.assert_close(
+                dist_single[:n_single][single_order],
+                combined_distances[combined_order],
+                msg="Distances differ between single-host and multi-host"
+            )
+
+    def test_empty_host_returns_empty(self):
+        """Verify host with no assigned shards returns empty results."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        M = 100
+        # Use very few shards so some hosts get nothing when num_hosts is large
+        data = torch.randint(0, 2**31, (M, 400), dtype=torch.int32)
+        mask = torch.full((M, 400), 0x7FFFFFFF, dtype=torch.int32)
+
+        # With min_shards=1 and num_hosts=10, some hosts may get 0 shards
+        idx, cat, dist, cnt = ih.masked_hamming_sharded(
+            data, mask,
+            max_pairs=100,
+            min_shards=1,
+            host_index=9,  # High index
+            num_hosts=10   # Many hosts
+        )
+
+        # Should return valid (possibly empty) tensors
+        assert idx.shape[1] == 2
+        assert cnt.shape == (1,)
+        # Count should be >= 0
+        assert cnt.item() >= 0
+
+    def test_deterministic_shard_assignment(self):
+        """Verify shard assignment is deterministic across calls."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        M = 2000
+        num_hosts = 4
+
+        # Get shards multiple times
+        for _ in range(3):
+            shards_by_host = {}
+            for host_idx in range(num_hosts):
+                shards = ih.get_self_shard_info(
+                    m=M, min_shards=8, host_index=host_idx, num_hosts=num_hosts
+                )
+                # Store as tuple of (a_start, a_end, b_start, b_end)
+                shards_by_host[host_idx] = [
+                    (s.a_start, s.a_end, s.b_start, s.b_end, s.global_shard_id)
+                    for s in shards
+                ]
+
+            # First iteration, save for comparison
+            if _ == 0:
+                reference = shards_by_host
+            else:
+                # Compare to reference
+                for host_idx in range(num_hosts):
+                    assert shards_by_host[host_idx] == reference[host_idx], \
+                        f"Shard assignment not deterministic for host {host_idx}"
