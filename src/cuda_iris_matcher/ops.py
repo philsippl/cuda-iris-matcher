@@ -25,6 +25,44 @@ DEFAULT_D0_DIM = _C.DEFAULT_D0_DIM
 DEFAULT_D1_DIM = _C.DEFAULT_D1_DIM
 DEFAULT_DIMS = (DEFAULT_R_DIM, DEFAULT_THETA_DIM, DEFAULT_D0_DIM, DEFAULT_D1_DIM)
 
+# Default vector dimension for dot product
+DEFAULT_DOT_VEC_DIM = _C.DEFAULT_DOT_VEC_DIM
+
+
+def dot_product_dense_cuda(data: torch.Tensor) -> torch.Tensor:
+    """
+    Compute dense pairwise dot product similarity matrix using optimal backend.
+    
+    Uses PyTorch's cuBLAS-backed mm for maximum performance.
+    
+    Args:
+        data: CUDA float16 tensor of shape [M, vec_dim] containing feature vectors.
+    
+    Returns:
+        Float32 tensor of shape [M, M] with pairwise dot products.
+    
+    Note:
+        For filtered output with classification, use dot_product_cuda instead.
+    """
+    # Use PyTorch mm (cuBLAS) for best performance
+    return torch.mm(data.float(), data.float().t())
+
+
+def dot_product_ab_dense_cuda(data_a: torch.Tensor, data_b: torch.Tensor) -> torch.Tensor:
+    """
+    Compute dense A vs B dot product similarity matrix using optimal backend.
+    
+    Uses PyTorch's cuBLAS-backed mm for maximum performance.
+    
+    Args:
+        data_a: CUDA float16 tensor of shape [M_A, vec_dim]
+        data_b: CUDA float16 tensor of shape [M_B, vec_dim]
+    
+    Returns:
+        Float32 tensor of shape [M_A, M_B] with pairwise dot products.
+    """
+    return torch.mm(data_a.float(), data_b.float().t())
+
 
 def _resolve_dims(
     dims: Optional[Tuple[int, int, int, int]],
@@ -356,3 +394,142 @@ def repack_to_theta_major_cuda(
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.repack_to_theta_major_cuda(input, r_dim, theta_dim, d0_dim, d1_dim)
+
+
+# ----------------- Dot Product Similarity Functions -----------------
+
+
+def dot_product_cuda(
+    data: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
+    match_threshold: float = 0.5,
+    non_match_threshold: float = 0.5,
+    is_similarity: bool = True,
+    include_flags: int = INCLUDE_ALL,
+    max_pairs: int = 1_000_000,
+    vec_dim: int = DEFAULT_DOT_VEC_DIM,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute dot product similarity for all pairs within a single set.
+    Only the lower triangle (i > j) is computed.
+
+    Uses f16 (half precision) vectors and tensor cores for fast computation.
+
+    Args:
+        data: CUDA float16 tensor of shape [M, vec_dim] containing feature vectors.
+        labels: Optional CUDA int32 tensor of shape [M] with identity labels.
+                If None, no classification is performed and all pairs are returned.
+        match_threshold: Threshold for match classification (default: 0.5)
+                        For similarity metrics, pairs with score >= threshold are matches.
+        non_match_threshold: Threshold for non-match classification (default: 0.5)
+                            For similarity metrics, pairs with score < threshold are non-matches.
+        is_similarity: If True (default), higher values = more similar (use >= for match).
+                       If False, lower values = more similar (use <= for match).
+        include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
+                       Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
+        max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        vec_dim: Expected vector dimension (default: 512). Will be inferred from data if different.
+
+    Returns:
+        Tuple of (pair_indices, categories, scores, count):
+        - pair_indices: [N, 2] int32 - (row, col) indices of pairs
+        - categories: [N] uint8 - category codes (0=TM, 1=FM, 2=FNM, 3=TNM, 255=unclassified)
+        - scores: [N] float32 - dot product similarity scores
+        - count: [1] int32 - actual number of pairs (N == len(pair_indices))
+
+    Note:
+        The returned tensors are pre-sliced to contain only the valid entries.
+        Synchronization is handled internally.
+
+    Example:
+        Basic usage with f16 feature vectors:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Create normalized f16 feature vectors [M, 512]
+        >>> data = torch.randn(100, 512, dtype=torch.float16, device="cuda")
+        >>> data = data / data.norm(dim=1, keepdim=True)
+        >>> # Compute all pairwise dot products
+        >>> pairs, cats, scores, count = ih.dot_product_cuda(data)
+        >>> print(f"Found {count.item()} pairs")
+
+        With identity labels for classification:
+
+        >>> labels = torch.arange(100, dtype=torch.int32, device="cuda")
+        >>> pairs, cats, scores, count = ih.dot_product_cuda(
+        ...     data, labels=labels,
+        ...     match_threshold=0.8,
+        ...     include_flags=ih.INCLUDE_TM | ih.INCLUDE_FM
+        ... )
+    """
+    return _C.dot_product_cuda(
+        data, labels,
+        match_threshold, non_match_threshold,
+        is_similarity, include_flags, max_pairs, vec_dim
+    )
+
+
+def dot_product_ab_cuda(
+    data_a: torch.Tensor,
+    data_b: torch.Tensor,
+    labels_a: Optional[torch.Tensor] = None,
+    labels_b: Optional[torch.Tensor] = None,
+    match_threshold: float = 0.5,
+    non_match_threshold: float = 0.5,
+    is_similarity: bool = True,
+    include_flags: int = INCLUDE_ALL,
+    max_pairs: int = 1_000_000,
+    vec_dim: int = DEFAULT_DOT_VEC_DIM,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute dot product similarity between two different sets A and B.
+    Computes the full M_A x M_B matrix (not just lower triangle).
+
+    Uses f16 (half precision) vectors and tensor cores for fast computation.
+
+    Args:
+        data_a: CUDA float16 tensor of shape [M_A, vec_dim] containing feature vectors.
+        data_b: CUDA float16 tensor of shape [M_B, vec_dim] containing feature vectors.
+        labels_a: Optional CUDA int32 tensor of shape [M_A] with identity labels.
+        labels_b: Optional CUDA int32 tensor of shape [M_B] with identity labels.
+                  Both labels_a and labels_b must be provided, or neither.
+                  If None, no classification is performed and all pairs are returned.
+        match_threshold: Threshold for match classification (default: 0.5)
+        non_match_threshold: Threshold for non-match classification (default: 0.5)
+        is_similarity: If True (default), higher values = more similar (use >= for match).
+                       If False, lower values = more similar (use <= for match).
+        include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
+        max_pairs: Maximum number of pairs to return (default: 1,000,000)
+        vec_dim: Expected vector dimension (default: 512). Will be inferred from data if different.
+
+    Returns:
+        Tuple of (pair_indices, categories, scores, count):
+        - pair_indices: [N, 2] int32 - (row_a, col_b) indices of pairs
+        - categories: [N] uint8 - category codes (0=TM, 1=FM, 2=FNM, 3=TNM, 255=unclassified)
+        - scores: [N] float32 - dot product similarity scores
+        - count: [1] int32 - actual number of pairs
+
+    Example:
+        Compare a gallery set against probe samples:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Gallery: 10000 enrolled feature vectors
+        >>> gallery = torch.randn(10000, 512, dtype=torch.float16, device="cuda")
+        >>> gallery = gallery / gallery.norm(dim=1, keepdim=True)
+        >>> # Probe: 50 query feature vectors
+        >>> probe = torch.randn(50, 512, dtype=torch.float16, device="cuda")
+        >>> probe = probe / probe.norm(dim=1, keepdim=True)
+        >>> # Find all similarities
+        >>> pairs, _, scores, count = ih.dot_product_ab_cuda(
+        ...     gallery, probe,
+        ...     match_threshold=0.8
+        ... )
+        >>> # pairs[:, 0] = gallery index, pairs[:, 1] = probe index
+    """
+    return _C.dot_product_ab_cuda(
+        data_a, data_b,
+        labels_a, labels_b,
+        match_threshold, non_match_threshold,
+        is_similarity, include_flags, max_pairs, vec_dim
+    )

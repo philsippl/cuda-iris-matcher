@@ -93,5 +93,18 @@ pybench-full: pybench-install
 pybench-json: pybench-install
 	python benchmarking/benchmark.py --json
 
-.PHONY: all run quick bench both compare clean test test-tc test-fallback pybench pybench-install pybench-quick pybench-full pybench-json
+# Dot product benchmark targets
+pybench-dot: pybench-install
+	python benchmarking/benchmark_dot_product.py
+
+pybench-dot-quick: pybench-install
+	python benchmarking/benchmark_dot_product.py --sizes 256,512,1024 --warmup 2 --repeats 3
+
+pybench-dot-full: pybench-install
+	python benchmarking/benchmark_dot_product.py --sizes 256,512,1024,2048,4096,8192 --warmup 5 --repeats 10
+
+pybench-dot-ab: pybench-install
+	python benchmarking/benchmark_dot_product.py --sizes 512,1024,2048,4096 --ab
+
+.PHONY: all run quick bench both compare clean test test-tc test-fallback pybench pybench-install pybench-quick pybench-full pybench-json pybench-dot pybench-dot-quick pybench-dot-full pybench-dot-ab
 

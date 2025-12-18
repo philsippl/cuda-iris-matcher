@@ -10,6 +10,7 @@ def get_ext_modules():
     sources = [
         "iris_binding.cu",
         "iris.cu",
+        "dot_product.cu",
     ]
 
     extra_cuda_cflags = ["-O3", "-std=c++17"]
