@@ -151,6 +151,28 @@ def masked_hamming_cuda(
     Note:
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
+
+    Example:
+        Basic usage with packed data:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Create packed iris codes [M, 400] and masks
+        >>> data = torch.randint(0, 2**31, (100, 400), dtype=torch.int32, device="cuda")
+        >>> mask = torch.full((100, 400), 0x7FFFFFFF, dtype=torch.int32, device="cuda")
+        >>> # Compute all pairwise distances
+        >>> pairs, cats, dists, count = ih.masked_hamming_cuda(data, mask)
+        >>> print(f"Found {count.item()} pairs")
+
+        With identity labels for classification:
+
+        >>> labels = torch.arange(100, dtype=torch.int32, device="cuda")
+        >>> pairs, cats, dists, count = ih.masked_hamming_cuda(
+        ...     data, mask, labels=labels,
+        ...     match_threshold=0.35,
+        ...     include_flags=ih.INCLUDE_TM | ih.INCLUDE_FM  # Only matches
+        ... )
+        >>> true_matches = pairs[cats == ih.CATEGORY_TRUE_MATCH]
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     
@@ -225,6 +247,25 @@ def masked_hamming_ab_cuda(
     Note:
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
+
+    Example:
+        Compare a gallery set against probe samples:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Gallery: 10000 enrolled iris codes
+        >>> gallery = torch.randint(0, 2**31, (10000, 400), dtype=torch.int32, device="cuda")
+        >>> gallery_mask = torch.full_like(gallery, 0x7FFFFFFF)
+        >>> # Probe: 50 query iris codes
+        >>> probe = torch.randint(0, 2**31, (50, 400), dtype=torch.int32, device="cuda")
+        >>> probe_mask = torch.full_like(probe, 0x7FFFFFFF)
+        >>> # Find all matches
+        >>> pairs, _, dists, count = ih.masked_hamming_ab_cuda(
+        ...     gallery, gallery_mask, probe, probe_mask,
+        ...     match_threshold=0.35
+        ... )
+        >>> # pairs[:, 0] = gallery index, pairs[:, 1] = probe index
+        >>> print(f"Found {count.item()} comparisons")
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     
@@ -271,6 +312,20 @@ def pack_theta_major_cuda(
     Constraints:
         - r_dim * d0_dim * d1_dim must be divisible by 32 (for whole-word theta shifts)
         - r_dim * theta_dim * d0_dim * d1_dim must be divisible by 256 (TensorCore alignment)
+
+    Example:
+        Pack raw iris codes for efficient matching:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Raw binary iris codes from feature extractor
+        >>> raw_codes = torch.randint(0, 2, (1000, 16, 200, 2, 2), dtype=torch.uint8, device="cuda")
+        >>> raw_masks = torch.ones_like(raw_codes)
+        >>> # Pack for efficient GPU matching (clone since it's in-place)
+        >>> packed_codes = ih.pack_theta_major(raw_codes.clone())
+        >>> packed_masks = ih.pack_theta_major(raw_masks.clone())
+        >>> print(packed_codes.shape)  # torch.Size([1000, 400])
+        >>> print(packed_codes.dtype)  # torch.int32
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     return _C.pack_theta_major_cuda(bits, r_dim, theta_dim, d0_dim, d1_dim)

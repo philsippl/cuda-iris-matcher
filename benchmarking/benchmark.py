@@ -389,14 +389,8 @@ def run_sharding_benchmark(
                 
                 sharded_times = []
                 for _ in range(benchmark_runs):
-                    # Sync all GPUs before timing
-                    for d in range(num_devices):
-                        torch.cuda.synchronize(d)
                     start = time.perf_counter()
                     ih.masked_hamming_sharded(test_data, test_mask, match_threshold=1.0, max_pairs=max_pairs_sharded, min_shards=sharded_min)
-                    # Sync all GPUs after to ensure completion
-                    for d in range(num_devices):
-                        torch.cuda.synchronize(d)
                     sharded_times.append((time.perf_counter() - start) * 1000)
                 
                 sharded_mean = np.mean(sharded_times)

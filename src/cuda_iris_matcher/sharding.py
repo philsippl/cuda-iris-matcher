@@ -218,6 +218,9 @@ def _run_shards_async(
     # Now synchronize all devices - this is where we wait for all GPUs
     for device_id in device_ids:
         streams[device_id].synchronize()
+    # Also do a full device sync to ensure all CUDA operations are complete
+    for device_id in device_ids:
+        torch.cuda.synchronize(device_id)
 
     # Process results (all kernels have completed)
     final_results: List[ShardResult] = []
@@ -694,6 +697,22 @@ def masked_hamming_ab_sharded(
         - categories: [N] uint8 - category codes
         - distances: [N] float32 - distance values
         - count: [1] int32 - actual number of pairs
+
+    Example:
+        Large-scale gallery vs probe matching across multiple GPUs:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Large gallery (100K enrolled users) and probe set (1K queries)
+        >>> gallery = torch.randint(0, 2**31, (100000, 400), dtype=torch.int32)
+        >>> gallery_mask = torch.full_like(gallery, 0x7FFFFFFF)
+        >>> probe = torch.randint(0, 2**31, (1000, 400), dtype=torch.int32)
+        >>> probe_mask = torch.full_like(probe, 0x7FFFFFFF)
+        >>> # Distributes 100M comparisons across all GPUs
+        >>> pairs, _, dists, count = ih.masked_hamming_ab_sharded(
+        ...     gallery, gallery_mask, probe, probe_mask
+        ... )
+        >>> print(f"Completed {count.item()} comparisons")
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(
         dims, r_dim, theta_dim, d0_dim, d1_dim
@@ -976,6 +995,32 @@ def masked_hamming_sharded(
         - categories: [N] uint8 - category codes
         - distances: [N] float32 - distance values
         - count: [1] int32 - actual number of pairs
+
+    Example:
+        Multi-GPU matching (automatically uses all available GPUs):
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # Large dataset on CPU
+        >>> data = torch.randint(0, 2**31, (50000, 400), dtype=torch.int32)
+        >>> mask = torch.full_like(data, 0x7FFFFFFF)
+        >>> # Automatically distributes across GPUs
+        >>> pairs, cats, dists, count = ih.masked_hamming_sharded(data, mask)
+        >>> print(f"Using {ih.get_device_count()} GPUs, found {count.item()} pairs")
+
+        Force tiling on single GPU (useful for memory-limited scenarios):
+
+        >>> pairs, cats, dists, count = ih.masked_hamming_sharded(
+        ...     data, mask, min_shards=4  # Split into at least 4 tiles
+        ... )
+
+        Multi-host distributed computation:
+
+        >>> # On host 0 of 4:
+        >>> result_0 = ih.masked_hamming_sharded(data, mask, host_index=0, num_hosts=4)
+        >>> # On host 1 of 4:
+        >>> result_1 = ih.masked_hamming_sharded(data, mask, host_index=1, num_hosts=4)
+        >>> # ... aggregate results from all hosts
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(
         dims, r_dim, theta_dim, d0_dim, d1_dim
@@ -1227,10 +1272,19 @@ def pack_theta_major_batched(
         CPU int32 tensor of shape (M, k_words) with packed bits in theta-major order.
 
     Example:
-        >>> # For 1 million samples that don't fit on GPU
-        >>> raw_codes = torch.from_numpy(codes)  # (1M, 16, 200, 2, 2) uint8 on CPU
-        >>> packed = pack_theta_major_batched(raw_codes, batch_size=50000)
-        >>> # packed is (1M, 400) int32 on CPU, ready for sharded matching
+        Pack a large dataset that doesn't fit on GPU:
+
+        >>> import torch
+        >>> import cuda_iris_matcher as ih
+        >>> # 1 million iris codes on CPU (too large for GPU)
+        >>> raw_codes = torch.randint(0, 2, (1000000, 16, 200, 2, 2), dtype=torch.uint8)
+        >>> raw_masks = torch.ones_like(raw_codes)
+        >>> # Pack in batches (auto-determines batch size based on GPU memory)
+        >>> packed_codes = ih.pack_theta_major_batched(raw_codes)
+        >>> packed_masks = ih.pack_theta_major_batched(raw_masks)
+        >>> print(packed_codes.shape)  # torch.Size([1000000, 400])
+        >>> # Now use with sharded matching
+        >>> pairs, _, dists, count = ih.masked_hamming_sharded(packed_codes, packed_masks)
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(
         dims, r_dim, theta_dim, d0_dim, d1_dim
