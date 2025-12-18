@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Callable, Any
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -99,60 +99,6 @@ def _filter_shards_for_host(
                 )
             )
     return filtered
-
-
-def _run_shards_concurrent(
-    shards: List[ShardConfig],
-    shard_fn: Callable[[ShardConfig], Optional[ShardResult]],
-    max_workers: Optional[int] = None,
-) -> List[ShardResult]:
-    """Run shard computations concurrently using thread pool.
-
-    Uses concurrent execution only when there are multiple GPUs to benefit from
-    parallelism. For single-GPU cases, runs sequentially to avoid thread overhead.
-
-    Args:
-        shards: List of shard configurations
-        shard_fn: Function that takes a ShardConfig and returns ShardResult or None
-        max_workers: Max threads (None = number of unique devices in shards)
-
-    Returns:
-        List of non-None ShardResults
-    """
-    if len(shards) == 0:
-        return []
-
-    # Count unique devices
-    unique_devices = len(set(s.device_id for s in shards))
-
-    # Only use concurrent execution if there are multiple GPUs
-    # For single GPU, thread overhead hurts more than it helps
-    if unique_devices <= 1:
-        results = []
-        for shard in shards:
-            result = shard_fn(shard)
-            if result is not None:
-                results.append(result)
-        return results
-
-    # Multi-GPU: use concurrent execution
-    if max_workers is None:
-        max_workers = unique_devices
-
-    results = []
-
-    # Use ThreadPoolExecutor - PyTorch GPU ops release the GIL
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all shards
-        future_to_shard = {executor.submit(shard_fn, shard): shard for shard in shards}
-
-        # Collect results as they complete
-        for future in as_completed(future_to_shard):
-            result = future.result()
-            if result is not None:
-                results.append(result)
-
-    return results
 
 
 def _run_shards_async(
@@ -360,69 +306,6 @@ def _pack_on_device(
         return packed_gpu
 
 
-def _replicate_to_devices(
-    tensors: List[torch.Tensor],
-    device_ids: List[int],
-    primary_device: int = 0,
-) -> List[List[torch.Tensor]]:
-    """Replicate tensors to multiple GPU devices in parallel.
-
-    Uses ThreadPoolExecutor to parallelize the Python overhead of GPU-to-GPU copies.
-    Each thread handles copying to one target device.
-
-    Args:
-        tensors: List of tensors on the primary device to replicate
-        device_ids: List of target device IDs (should include primary_device)
-        primary_device: The device where tensors currently reside
-
-    Returns:
-        List of lists: outer index is tensor index, inner index matches device_ids order
-        E.g., result[0][1] is tensors[0] on device_ids[1]
-    """
-    if len(device_ids) <= 1:
-        # Single device - just return original tensors
-        return [[t] for t in tensors]
-
-    # Pre-allocate result structure
-    results: List[List[Optional[torch.Tensor]]] = [
-        [None] * len(device_ids) for _ in tensors
-    ]
-
-    # Identify which devices need copies
-    target_devices = [d for d in device_ids if d != primary_device]
-
-    # Set primary device results (no copy needed)
-    primary_idx = device_ids.index(primary_device)
-    for t_idx, tensor in enumerate(tensors):
-        results[t_idx][primary_idx] = tensor
-
-    if not target_devices:
-        return [[t] for t in tensors]  # type: ignore
-
-    # Function to copy all tensors to a single target device
-    def copy_to_device(device_id: int) -> Tuple[int, List[torch.Tensor]]:
-        dev_idx = device_ids.index(device_id)
-        copied = []
-        with torch.cuda.device(device_id):
-            stream = torch.cuda.Stream(device=device_id)
-            with torch.cuda.stream(stream):
-                for tensor in tensors:
-                    copied.append(tensor.to(device_id, non_blocking=True))
-            stream.synchronize()
-        return dev_idx, copied
-
-    # Launch copies to all target devices in parallel using threads
-    # This parallelizes the Python/C++ overhead of setting up GPU-to-GPU transfers
-    with ThreadPoolExecutor(max_workers=len(target_devices)) as executor:
-        futures = [executor.submit(copy_to_device, d) for d in target_devices]
-        for future in as_completed(futures):
-            dev_idx, copied = future.result()
-            for t_idx, tensor in enumerate(copied):
-                results[t_idx][dev_idx] = tensor
-
-    return results  # type: ignore
-
-
 def _compute_shard_configs(
     m_a: int,
     m_b: int,
@@ -574,10 +457,8 @@ def _compute_self_shard_configs(
 
     tile_size = math.ceil(m / n_tiles)
 
-    # First pass: collect all tiles with their estimated work (not just pair counts)
-    # Measurements show diagonal tiles (self-comparison) have nearly same cost per pair
-    # as off-diagonal tiles (A-B comparison), so we use weight of 1.0
-    DIAGONAL_WEIGHT = 1.0
+    # First pass: collect all tiles with their estimated work (pair counts)
+    # Profiling shows diagonal and off-diagonal tiles have similar cost per pair
     tiles_with_work: List[Tuple[int, int, int, int, int]] = []  # (a_start, a_end, b_start, b_end, work)
     for i in range(n_tiles):
         a_start = i * tile_size
@@ -595,10 +476,9 @@ def _compute_self_shard_configs(
             if a_end > b_start:
                 a_size = a_end - a_start
                 b_size = b_end - b_start
-                # Diagonal tiles: lower triangle only, weighted higher
                 if a_start == b_start:
-                    pairs = a_size * (a_size - 1) // 2
-                    work = int(pairs * DIAGONAL_WEIGHT)
+                    # Diagonal tiles: lower triangle only
+                    work = a_size * (a_size - 1) // 2
                 else:
                     # Off-diagonal tiles: full rectangle
                     work = a_size * b_size
