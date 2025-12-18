@@ -372,7 +372,9 @@ def run_sharding_benchmark(
         if sharded_min:
             shard_configs = ih.get_shard_info(M, M, min_shards=sharded_min)
             actual_shards = len(shard_configs)
-            max_pairs_sharded = max(1, n_pairs_self // 100)
+            max_pairs_sharded = 100 # limit for max performance
+            
+            print("Starting sharded benchmark...")
             
             # Test each data format (packed, and optionally unpacked)
             for format_name, is_packed in data_formats:
