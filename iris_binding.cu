@@ -31,6 +31,78 @@ extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   int d0_dim, int d1_dim,
                                                   cudaStream_t stream);
 
+// Async version: returns GPU tensors without synchronization
+// Caller must synchronize before reading results
+std::vector<torch::Tensor>
+masked_hamming_cuda_async(torch::Tensor data, torch::Tensor mask,
+                          std::optional<torch::Tensor> labels,
+                          double match_threshold, double non_match_threshold,
+                          bool is_similarity, int64_t include_flags,
+                          int64_t max_pairs, int64_t r_dim, int64_t theta_dim,
+                          int64_t d0_dim, int64_t d1_dim) {
+  TORCH_CHECK(data.is_cuda(), "data must be CUDA");
+  TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
+  TORCH_CHECK(data.scalar_type() == at::kInt, "data dtype must be int32");
+  TORCH_CHECK(mask.scalar_type() == at::kInt, "mask dtype must be int32");
+  TORCH_CHECK(data.is_contiguous() && mask.is_contiguous(),
+              "data/mask must be contiguous");
+  TORCH_CHECK(data.sizes() == mask.sizes(), "data/mask shape mismatch");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(data.dim() == 2 && data.size(1) == cfg.k_words,
+              "expected data shape [M, ", cfg.k_words, "] for dims (", r_dim,
+              ", ", theta_dim, ", ", d0_dim, ", ", d1_dim, ")");
+
+  int64_t M = data.size(0);
+  auto opts_int = data.options();
+  auto opts_float = data.options().dtype(torch::kFloat32);
+  auto opts_byte = data.options().dtype(torch::kUInt8);
+
+  // Validate labels if provided
+  if (labels.has_value()) {
+    TORCH_CHECK(labels->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels->scalar_type() == at::kInt,
+                "labels dtype must be int32");
+    TORCH_CHECK(labels->is_contiguous(), "labels must be contiguous");
+    TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
+                "labels must have shape [M]");
+  }
+
+  // Buffers
+  auto premasked = torch::zeros_like(data);
+
+  // GPU buffers for kernel output (stay on GPU)
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+
+  // Use current stream (respects torch.cuda.stream() context)
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_masked_hamming_cuda(
+      reinterpret_cast<uint32_t *>(data.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(mask.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(premasked.data_ptr<int>()), (int)M,
+      (int)r_dim, (int)theta_dim,
+      labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold, is_similarity,
+      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+
+  // Return GPU tensors - caller must sync current stream before reading
+  return {pair_indices_gpu, categories_gpu, distances_gpu, match_count_gpu};
+}
+
+// Sync version: returns CPU tensors (original behavior)
 std::vector<torch::Tensor>
 masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
                     std::optional<torch::Tensor> labels, double match_threshold,
@@ -145,6 +217,103 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   return {pair_indices_out, categories_out, distances_out, match_count_cpu};
 }
 
+// Async version: returns GPU tensors without synchronization
+// Caller must synchronize before reading results
+std::vector<torch::Tensor> masked_hamming_ab_cuda_async(
+    torch::Tensor data_a, torch::Tensor mask_a, torch::Tensor data_b,
+    torch::Tensor mask_b, std::optional<torch::Tensor> labels_a,
+    std::optional<torch::Tensor> labels_b, double match_threshold,
+    double non_match_threshold, bool is_similarity, int64_t include_flags,
+    int64_t max_pairs, int64_t r_dim, int64_t theta_dim, int64_t d0_dim,
+    int64_t d1_dim) {
+  TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
+  TORCH_CHECK(mask_a.is_cuda(), "mask_a must be CUDA");
+  TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
+  TORCH_CHECK(mask_b.is_cuda(), "mask_b must be CUDA");
+  TORCH_CHECK(data_a.scalar_type() == at::kInt, "data_a dtype must be int32");
+  TORCH_CHECK(mask_a.scalar_type() == at::kInt, "mask_a dtype must be int32");
+  TORCH_CHECK(data_b.scalar_type() == at::kInt, "data_b dtype must be int32");
+  TORCH_CHECK(mask_b.scalar_type() == at::kInt, "mask_b dtype must be int32");
+  TORCH_CHECK(data_a.is_contiguous() && mask_a.is_contiguous(),
+              "data_a/mask_a must be contiguous");
+  TORCH_CHECK(data_b.is_contiguous() && mask_b.is_contiguous(),
+              "data_b/mask_b must be contiguous");
+  TORCH_CHECK(data_a.sizes() == mask_a.sizes(), "data_a/mask_a shape mismatch");
+  TORCH_CHECK(data_b.sizes() == mask_b.sizes(), "data_b/mask_b shape mismatch");
+
+  // Validate iris dimensions
+  const char *err = nullptr;
+  TORCH_CHECK(validate_iris_config((int)r_dim, (int)theta_dim, (int)d0_dim,
+                                   (int)d1_dim, &err),
+              err);
+  IrisConfig cfg = IrisConfig::from_dims((int)r_dim, (int)theta_dim,
+                                         (int)d0_dim, (int)d1_dim);
+
+  TORCH_CHECK(data_a.dim() == 2 && data_a.size(1) == cfg.k_words,
+              "expected data_a shape [M_A, ", cfg.k_words, "]");
+  TORCH_CHECK(data_b.dim() == 2 && data_b.size(1) == cfg.k_words,
+              "expected data_b shape [M_B, ", cfg.k_words, "]");
+
+  int64_t M_A = data_a.size(0);
+  int64_t M_B = data_b.size(0);
+  auto opts_int = data_a.options();
+  auto opts_float = data_a.options().dtype(torch::kFloat32);
+  auto opts_byte = data_a.options().dtype(torch::kUInt8);
+
+  // Validate labels if provided (both must be provided or neither)
+  bool has_labels = labels_a.has_value() && labels_b.has_value();
+  if (labels_a.has_value() || labels_b.has_value()) {
+    TORCH_CHECK(has_labels,
+                "Both labels_a and labels_b must be provided, or neither");
+  }
+  if (has_labels) {
+    TORCH_CHECK(labels_a->is_cuda(), "labels_a must be CUDA");
+    TORCH_CHECK(labels_b->is_cuda(), "labels_b must be CUDA");
+    TORCH_CHECK(labels_a->scalar_type() == at::kInt,
+                "labels_a dtype must be int32");
+    TORCH_CHECK(labels_b->scalar_type() == at::kInt,
+                "labels_b dtype must be int32");
+    TORCH_CHECK(labels_a->is_contiguous(), "labels_a must be contiguous");
+    TORCH_CHECK(labels_b->is_contiguous(), "labels_b must be contiguous");
+    TORCH_CHECK(labels_a->dim() == 1 && labels_a->size(0) == M_A,
+                "labels_a must have shape [M_A]");
+    TORCH_CHECK(labels_b->dim() == 1 && labels_b->size(0) == M_B,
+                "labels_b must have shape [M_B]");
+  }
+
+  // Buffers
+  auto premasked_a = torch::zeros_like(data_a);
+  auto premasked_b = torch::zeros_like(data_b);
+
+  // GPU buffers for kernel output (stay on GPU)
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+
+  // Use current stream (respects torch.cuda.stream() context)
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_masked_hamming_ab_cuda(
+      reinterpret_cast<uint32_t *>(data_a.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(mask_a.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(premasked_a.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(data_b.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(mask_b.data_ptr<int>()),
+      reinterpret_cast<uint32_t *>(premasked_b.data_ptr<int>()), (int)M_A,
+      (int)M_B, (int)r_dim, (int)theta_dim,
+      has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
+      has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold, is_similarity,
+      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+
+  // Return GPU tensors - caller must sync current stream before reading
+  return {pair_indices_gpu, categories_gpu, distances_gpu, match_count_gpu};
+}
+
+// Sync version: returns CPU tensors (original behavior)
 std::vector<torch::Tensor> masked_hamming_ab_cuda(
     torch::Tensor data_a, torch::Tensor mask_a, torch::Tensor data_b,
     torch::Tensor mask_b, std::optional<torch::Tensor> labels_a,
@@ -369,9 +538,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("r_dim") = DEFAULT_R_DIM,
         py::arg("theta_dim") = DEFAULT_THETA_DIM,
         py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+  m.def("masked_hamming_cuda_async", &masked_hamming_cuda_async,
+        "Async masked hamming distance (returns GPU tensors, caller must sync)",
+        py::arg("data"), py::arg("mask"), py::arg("labels") = py::none(),
+        py::arg("match_threshold") = 0.35,
+        py::arg("non_match_threshold") = 0.35, py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
+        py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
   m.def("masked_hamming_ab_cuda", &masked_hamming_ab_cuda,
         "Masked hamming distance between two sets A and B with classification "
         "(CUDA)",
+        py::arg("data_a"), py::arg("mask_a"), py::arg("data_b"),
+        py::arg("mask_b"), py::arg("labels_a") = py::none(),
+        py::arg("labels_b") = py::none(), py::arg("match_threshold") = 0.35,
+        py::arg("non_match_threshold") = 0.35, py::arg("is_similarity") = false,
+        py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
+        py::arg("r_dim") = DEFAULT_R_DIM,
+        py::arg("theta_dim") = DEFAULT_THETA_DIM,
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+  m.def("masked_hamming_ab_cuda_async", &masked_hamming_ab_cuda_async,
+        "Async masked hamming A vs B (returns GPU tensors, caller must sync)",
         py::arg("data_a"), py::arg("mask_a"), py::arg("data_b"),
         py::arg("mask_b"), py::arg("labels_a") = py::none(),
         py::arg("labels_b") = py::none(), py::arg("match_threshold") = 0.35,

@@ -249,6 +249,192 @@ def run_benchmark_suite(
     return results
 
 
+@dataclass
+class ShardingBenchmarkResult:
+    """Result from sharding benchmark."""
+    m_a: int
+    m_b: int
+    n_pairs: int
+    num_devices: int
+    num_shards: int
+    
+    # Timing (ms)
+    total_time_ms_mean: float
+    total_time_ms_std: float
+    
+    # Throughput
+    pairs_per_second_millions: float
+    
+    # Comparison with non-sharded
+    speedup_vs_single: Optional[float]  # None if not comparable
+    
+    n_runs: int
+
+
+def run_sharding_benchmark(
+    sizes: List[int],
+    warmup_runs: int = 2,
+    benchmark_runs: int = 5,
+    min_shards_list: Optional[List[int]] = None,
+    skip_baseline: bool = False,
+    include_packing: bool = False,
+) -> List[ShardingBenchmarkResult]:
+    """
+    Benchmark sharded operations across all available devices.
+    
+    Args:
+        sizes: List of M values (will test M×M self-comparison and M×M A vs B)
+        warmup_runs: Number of warmup iterations
+        benchmark_runs: Number of timed iterations
+        min_shards_list: List of min_shards values to test (for simulating multi-GPU)
+        skip_baseline: Skip single-GPU baseline benchmark
+        include_packing: Also benchmark with unpacked (uint8) data to measure packing overhead
+    
+    Returns:
+        List of ShardingBenchmarkResult
+    """
+    num_devices = torch.cuda.device_count()
+    results = []
+    
+    if min_shards_list is None:
+        # Default: just test baseline (1) and one sharded config (4 shards for tiling)
+        min_shards_list = [1, 4]
+    
+    # Data format configurations to test
+    data_formats = [("packed", True)]
+    if include_packing:
+        data_formats.append(("unpacked", False))
+    
+    for M in sizes:
+        n_pairs_self = M * (M - 1) // 2
+        
+        print(f"\n  M={M:,} ({n_pairs_self:,} pairs)")
+        
+        # Generate packed data on CPU (sharding will distribute to GPUs)
+        data_packed = torch.randint(0, 2**31, (M, 400), dtype=torch.int32)
+        mask_packed = torch.full((M, 400), 0x7FFFFFFF, dtype=torch.int32)
+        
+        # Generate unpacked data if needed (shape: [M, r_dim=16, theta_dim=200, d0_dim=2, d1_dim=2])
+        if include_packing:
+            # Default iris code dimensions (from iris_params.h)
+            R_DIM, THETA_DIM, D0_DIM, D1_DIM = 16, 200, 2, 2
+            data_unpacked = torch.randint(0, 2, (M, R_DIM, THETA_DIM, D0_DIM, D1_DIM), dtype=torch.uint8)
+            mask_unpacked = torch.ones((M, R_DIM, THETA_DIM, D0_DIM, D1_DIM), dtype=torch.uint8)
+        
+        # Select data based on format
+        data = data_packed
+        mask = mask_packed
+        
+        baseline_mean = None
+        baseline_throughput = None
+        
+        if not skip_baseline:
+            # Get baseline with non-sharded on single GPU
+            data_gpu = data.cuda(0)
+            mask_gpu = mask.cuda(0)
+            max_pairs_baseline = 100 #max(1, n_pairs_self // 100)
+            
+            # Warmup + benchmark baseline
+            for _ in range(warmup_runs):
+                ih.masked_hamming_cuda(data_gpu, mask_gpu, match_threshold=1.0, max_pairs=max_pairs_baseline)
+                torch.cuda.synchronize()
+            
+            baseline_times = []
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            for _ in range(benchmark_runs):
+                start_event.record()
+                ih.masked_hamming_cuda(data_gpu, mask_gpu, match_threshold=1.0, max_pairs=max_pairs_baseline)
+                end_event.record()
+                torch.cuda.synchronize()
+                baseline_times.append(start_event.elapsed_time(end_event))
+            
+            baseline_mean = np.mean(baseline_times)
+            baseline_std = np.std(baseline_times)
+            baseline_throughput = n_pairs_self / (baseline_mean / 1000) / 1e6
+            
+            results.append(ShardingBenchmarkResult(
+                m_a=M, m_b=M, n_pairs=n_pairs_self,
+                num_devices=1, num_shards=1,
+                total_time_ms_mean=baseline_mean,
+                total_time_ms_std=baseline_std,
+                pairs_per_second_millions=baseline_throughput,
+                speedup_vs_single=1.0,
+                n_runs=benchmark_runs,
+            ))
+            
+            del data_gpu, mask_gpu
+            torch.cuda.empty_cache()
+        
+        # Test sharded version (skip if min_shards=1 since that's baseline)
+        sharded_min = max(s for s in min_shards_list if s > 1) if any(s > 1 for s in min_shards_list) else None
+        
+        if sharded_min:
+            shard_configs = ih.get_shard_info(M, M, min_shards=sharded_min)
+            actual_shards = len(shard_configs)
+            max_pairs_sharded = 100 # limit for max performance
+            
+            print("Starting sharded benchmark...")
+            
+            # Test each data format (packed, and optionally unpacked)
+            for format_name, is_packed in data_formats:
+                if is_packed:
+                    test_data, test_mask = data_packed, mask_packed
+                else:
+                    test_data, test_mask = data_unpacked, mask_unpacked
+                
+                # Warmup + benchmark sharded
+                for _ in range(warmup_runs):
+                    ih.masked_hamming_sharded(test_data, test_mask, match_threshold=1.0, max_pairs=max_pairs_sharded, min_shards=sharded_min)
+                
+                sharded_times = []
+                for _ in range(benchmark_runs):
+                    start = time.perf_counter()
+                    ih.masked_hamming_sharded(test_data, test_mask, match_threshold=1.0, max_pairs=max_pairs_sharded, min_shards=sharded_min)
+                    sharded_times.append((time.perf_counter() - start) * 1000)
+                
+                sharded_mean = np.mean(sharded_times)
+                sharded_std = np.std(sharded_times)
+                sharded_throughput = n_pairs_self / (sharded_mean / 1000) / 1e6
+                speedup = baseline_mean / sharded_mean if baseline_mean else None
+                
+                # Print compact result line
+                format_label = f"[{format_name}] " if include_packing else ""
+                if baseline_mean:
+                    print(f"    Baseline: {baseline_mean:.2f}ms ({baseline_throughput:.1f}M/s) | "
+                          f"Sharded {format_label}({actual_shards} tiles): {sharded_mean:.2f}ms ({sharded_throughput:.1f}M/s) | "
+                          f"Speedup: {speedup:.2f}x")
+                else:
+                    print(f"    Sharded {format_label}({actual_shards} tiles): {sharded_mean:.2f}ms ({sharded_throughput:.1f}M/s)")
+                
+                results.append(ShardingBenchmarkResult(
+                    m_a=M, m_b=M, n_pairs=n_pairs_self,
+                    num_devices=num_devices, num_shards=actual_shards,
+                    total_time_ms_mean=sharded_mean,
+                    total_time_ms_std=sharded_std,
+                    pairs_per_second_millions=sharded_throughput,
+                    speedup_vs_single=speedup,
+                    n_runs=benchmark_runs,
+                ))
+        elif not skip_baseline:
+            print(f"    Baseline: {baseline_mean:.2f}ms ({baseline_throughput:.1f}M/s)")
+        
+        del data_packed, mask_packed
+        if include_packing:
+            del data_unpacked, mask_unpacked
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    return results
+
+
+def print_sharding_summary(results: List[ShardingBenchmarkResult]):
+    """Print sharding benchmark summary (already printed inline)."""
+    # Summary already printed per-size, just show device count
+    if results:
+        print(f"\n  GPUs available: {torch.cuda.device_count()}")
+
+
 def run_ab_benchmark(
     sizes_a: List[int],
     sizes_b: List[int],
@@ -367,13 +553,13 @@ def main():
     parser.add_argument(
         "--warmup",
         type=int,
-        default=3,
+        default=0,
         help="Number of warmup runs per size",
     )
     parser.add_argument(
         "--repeats",
         type=int,
-        default=10,
+        default=1,
         help="Number of benchmark runs per size",
     )
     parser.add_argument(
@@ -393,6 +579,32 @@ def main():
         action="store_true",
         help="Also run A vs B benchmark",
     )
+    parser.add_argument(
+        "--sharding",
+        action="store_true",
+        help="Run sharding benchmark (multi-GPU and tiled computation)",
+    )
+    parser.add_argument(
+        "--sharding-only",
+        action="store_true",
+        help="Run only sharding benchmark (skip regular benchmarks)",
+    )
+    parser.add_argument(
+        "--min-shards",
+        type=str,
+        default=None,
+        help="Comma-separated list of min_shards values to test (default: auto)",
+    )
+    parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip baseline benchmark in sharding tests",
+    )
+    parser.add_argument(
+        "--include-packing",
+        action="store_true",
+        help="Include benchmark with unpacked (uint8) data to measure packing overhead",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -405,42 +617,77 @@ def main():
     print("CUDA IRIS MATCHER BENCHMARK")
     print("=" * 60)
     print(f"Device: {torch.cuda.get_device_name(args.device)}")
+    print(f"Available GPUs: {torch.cuda.device_count()}")
     print(f"Batch sizes: {batch_sizes}")
     print(f"Warmup runs: {args.warmup}")
     print(f"Benchmark runs: {args.repeats}")
 
-    # Run self-comparison benchmark
-    summaries = run_benchmark_suite(
-        batch_sizes,
-        warmup_runs=args.warmup,
-        benchmark_runs=args.repeats,
-        device_idx=args.device,
-    )
-
-    print_summary_table(summaries)
-
-    # Run A vs B benchmark if requested
+    summaries = []
     ab_results = None
-    if args.ab_benchmark:
-        print("\n" + "=" * 60)
-        print("A VS B BENCHMARK")
-        print("=" * 60)
-        ab_results = run_ab_benchmark(
-            sizes_a=[256, 512, 1024],
-            sizes_b=[1024, 2048, 4096],
-            warmup_runs=2,
-            benchmark_runs=3,
+    sharding_results = None
+
+    # Run regular benchmarks unless --sharding-only
+    if not args.sharding_only:
+        # Run self-comparison benchmark
+        summaries = run_benchmark_suite(
+            batch_sizes,
+            warmup_runs=args.warmup,
+            benchmark_runs=args.repeats,
             device_idx=args.device,
         )
+
+        print_summary_table(summaries)
+
+        # Run A vs B benchmark if requested
+        if args.ab_benchmark:
+            print("\n" + "=" * 60)
+            print("A VS B BENCHMARK")
+            print("=" * 60)
+            ab_results = run_ab_benchmark(
+                sizes_a=[256, 512, 1024],
+                sizes_b=[1024, 2048, 4096],
+                warmup_runs=2,
+                benchmark_runs=3,
+                device_idx=args.device,
+            )
+
+    # Run sharding benchmark if requested
+    if args.sharding or args.sharding_only:
+        print("\n" + "=" * 60)
+        print("SHARDING BENCHMARK (Multi-GPU / Tiled)")
+        print("=" * 60)
+        
+        # Parse min_shards list if provided
+        min_shards_list = None
+        if args.min_shards:
+            min_shards_list = [int(x.strip()) for x in args.min_shards.split(",")]
+        
+        # Use smaller sizes for sharding benchmark by default
+        sharding_sizes = [s for s in batch_sizes if s <= 4096] or batch_sizes[:3]
+        
+        sharding_results = run_sharding_benchmark(
+            sizes=sharding_sizes,
+            warmup_runs=args.warmup,
+            benchmark_runs=args.repeats,
+            min_shards_list=min_shards_list,
+            skip_baseline=args.skip_baseline,
+            include_packing=args.include_packing,
+        )
+        
+        print_sharding_summary(sharding_results)
 
     # Save results to JSON if requested
     if args.output:
         output_data = {
             "device": torch.cuda.get_device_name(args.device),
-            "self_comparison": [asdict(s) for s in summaries],
+            "num_devices": torch.cuda.device_count(),
         }
+        if summaries:
+            output_data["self_comparison"] = [asdict(s) for s in summaries]
         if ab_results:
             output_data["ab_comparison"] = ab_results
+        if sharding_results:
+            output_data["sharding"] = [asdict(r) for r in sharding_results]
 
         with open(args.output, "w") as f:
             json.dump(output_data, f, indent=2)
