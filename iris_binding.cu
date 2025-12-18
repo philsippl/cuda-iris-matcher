@@ -1,9 +1,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
 #include "iris_params.h"
+
+// Default vector dimension for dot product
+constexpr int DEFAULT_DOT_VEC_DIM = 512;
 
 extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
@@ -30,6 +34,34 @@ extern "C" void launch_repack_to_theta_major_cuda(const uint32_t *input,
                                                   int r_dim, int theta_dim,
                                                   int d0_dim, int d1_dim,
                                                   cudaStream_t stream);
+
+// Dot product kernel declarations
+extern "C" void launch_dot_product_cuda(
+    const half *dData, int M, int vec_dim,
+    const int32_t *dLabels,
+    float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories,
+    float *dOutScores, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
+
+extern "C" void launch_dot_product_ab_cuda(
+    const half *dData_A, const half *dData_B,
+    int M_A, int M_B, int vec_dim,
+    const int32_t *dLabels_A, const int32_t *dLabels_B,
+    float match_threshold, float non_match_threshold,
+    bool is_similarity, uint8_t include_flags,
+    int32_t *dPairIndices, uint8_t *dCategories,
+    float *dOutScores, unsigned int *dMatchCount,
+    unsigned int max_pairs, cudaStream_t stream);
+
+// Dense output variants (high performance, no filtering)
+extern "C" void launch_dot_product_dense_cuda(
+    const half *dData, float *dOutput, int M, int vec_dim, cudaStream_t stream);
+
+extern "C" void launch_dot_product_ab_dense_cuda(
+    const half *dData_A, const half *dData_B, float *dOutput,
+    int M_A, int M_B, int vec_dim, cudaStream_t stream);
 
 // Async version: returns GPU tensors without synchronization
 // Caller must synchronize before reading results
@@ -528,6 +560,345 @@ torch::Tensor repack_to_theta_major_cuda(torch::Tensor input, int64_t r_dim,
   return output;
 }
 
+// ----------------- Dot Product Functions -----------------
+
+// Async version: returns GPU tensors without synchronization
+std::vector<torch::Tensor>
+dot_product_cuda_async(torch::Tensor data,
+                       std::optional<torch::Tensor> labels,
+                       double match_threshold, double non_match_threshold,
+                       bool is_similarity, int64_t include_flags,
+                       int64_t max_pairs, int64_t vec_dim) {
+  TORCH_CHECK(data.is_cuda(), "data must be CUDA");
+  TORCH_CHECK(data.scalar_type() == at::kHalf, "data dtype must be float16");
+  TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
+  TORCH_CHECK(data.dim() == 2, "data must have shape [M, vec_dim]");
+  
+  int64_t M = data.size(0);
+  int64_t actual_vec_dim = data.size(1);
+  
+  // Use actual vec_dim from tensor if vec_dim param is default
+  if (vec_dim == DEFAULT_DOT_VEC_DIM && actual_vec_dim != vec_dim) {
+    vec_dim = actual_vec_dim;
+  }
+  TORCH_CHECK(data.size(1) == vec_dim,
+              "expected data shape [M, ", vec_dim, "], got [", M, ", ", actual_vec_dim, "]");
+  
+  auto opts_int = data.options().dtype(torch::kInt32);
+  auto opts_float = data.options().dtype(torch::kFloat32);
+  auto opts_byte = data.options().dtype(torch::kUInt8);
+  
+  // Validate labels if provided
+  if (labels.has_value()) {
+    TORCH_CHECK(labels->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels->scalar_type() == at::kInt, "labels dtype must be int32");
+    TORCH_CHECK(labels->is_contiguous(), "labels must be contiguous");
+    TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
+                "labels must have shape [M]");
+  }
+  
+  // GPU buffers for output
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+  
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_dot_product_cuda(
+      reinterpret_cast<const half *>(data.data_ptr<at::Half>()),
+      (int)M, (int)vec_dim,
+      labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      scores_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+  
+  return {pair_indices_gpu, categories_gpu, scores_gpu, match_count_gpu};
+}
+
+// Sync version: returns CPU tensors
+std::vector<torch::Tensor>
+dot_product_cuda(torch::Tensor data,
+                 std::optional<torch::Tensor> labels,
+                 double match_threshold, double non_match_threshold,
+                 bool is_similarity, int64_t include_flags,
+                 int64_t max_pairs, int64_t vec_dim) {
+  TORCH_CHECK(data.is_cuda(), "data must be CUDA");
+  TORCH_CHECK(data.scalar_type() == at::kHalf, "data dtype must be float16");
+  TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
+  TORCH_CHECK(data.dim() == 2, "data must have shape [M, vec_dim]");
+  
+  int64_t M = data.size(0);
+  int64_t actual_vec_dim = data.size(1);
+  
+  if (vec_dim == DEFAULT_DOT_VEC_DIM && actual_vec_dim != vec_dim) {
+    vec_dim = actual_vec_dim;
+  }
+  TORCH_CHECK(data.size(1) == vec_dim,
+              "expected data shape [M, ", vec_dim, "], got [", M, ", ", actual_vec_dim, "]");
+  
+  auto opts_int = data.options().dtype(torch::kInt32);
+  auto opts_float = data.options().dtype(torch::kFloat32);
+  auto opts_byte = data.options().dtype(torch::kUInt8);
+  
+  if (labels.has_value()) {
+    TORCH_CHECK(labels->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels->scalar_type() == at::kInt, "labels dtype must be int32");
+    TORCH_CHECK(labels->is_contiguous(), "labels must be contiguous");
+    TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
+                "labels must have shape [M]");
+  }
+  
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+  
+  // Pinned CPU buffers
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+  
+  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
+  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
+  auto scores_cpu = torch::zeros({max_pairs}, cpu_opts_float);
+  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
+  
+  auto stream = at::cuda::getDefaultCUDAStream();
+  launch_dot_product_cuda(
+      reinterpret_cast<const half *>(data.data_ptr<at::Half>()),
+      (int)M, (int)vec_dim,
+      labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      scores_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+  
+  // Copy count and sync
+  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+                  sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+  
+  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  if (actual_count > max_pairs) {
+    actual_count = max_pairs;
+  }
+  
+  if (actual_count > 0) {
+    cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(scores_cpu.data_ptr(), scores_gpu.data_ptr(),
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  }
+  
+  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
+  auto categories_out = categories_cpu.slice(0, 0, actual_count);
+  auto scores_out = scores_cpu.slice(0, 0, actual_count);
+  
+  return {pair_indices_out, categories_out, scores_out, match_count_cpu};
+}
+
+// Async A vs B version
+std::vector<torch::Tensor>
+dot_product_ab_cuda_async(torch::Tensor data_a, torch::Tensor data_b,
+                          std::optional<torch::Tensor> labels_a,
+                          std::optional<torch::Tensor> labels_b,
+                          double match_threshold, double non_match_threshold,
+                          bool is_similarity, int64_t include_flags,
+                          int64_t max_pairs, int64_t vec_dim) {
+  TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
+  TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
+  TORCH_CHECK(data_a.scalar_type() == at::kHalf, "data_a dtype must be float16");
+  TORCH_CHECK(data_b.scalar_type() == at::kHalf, "data_b dtype must be float16");
+  TORCH_CHECK(data_a.is_contiguous(), "data_a must be contiguous");
+  TORCH_CHECK(data_b.is_contiguous(), "data_b must be contiguous");
+  TORCH_CHECK(data_a.dim() == 2, "data_a must have shape [M_A, vec_dim]");
+  TORCH_CHECK(data_b.dim() == 2, "data_b must have shape [M_B, vec_dim]");
+  
+  int64_t M_A = data_a.size(0);
+  int64_t M_B = data_b.size(0);
+  int64_t actual_vec_dim_a = data_a.size(1);
+  int64_t actual_vec_dim_b = data_b.size(1);
+  
+  TORCH_CHECK(actual_vec_dim_a == actual_vec_dim_b,
+              "data_a and data_b must have same vec_dim");
+  
+  if (vec_dim == DEFAULT_DOT_VEC_DIM && actual_vec_dim_a != vec_dim) {
+    vec_dim = actual_vec_dim_a;
+  }
+  
+  auto opts_int = data_a.options().dtype(torch::kInt32);
+  auto opts_float = data_a.options().dtype(torch::kFloat32);
+  auto opts_byte = data_a.options().dtype(torch::kUInt8);
+  
+  bool has_labels = labels_a.has_value() && labels_b.has_value();
+  if (labels_a.has_value() || labels_b.has_value()) {
+    TORCH_CHECK(has_labels, "Both labels_a and labels_b must be provided, or neither");
+  }
+  if (has_labels) {
+    TORCH_CHECK(labels_a->is_cuda() && labels_b->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels_a->scalar_type() == at::kInt && labels_b->scalar_type() == at::kInt,
+                "labels dtype must be int32");
+    TORCH_CHECK(labels_a->is_contiguous() && labels_b->is_contiguous(),
+                "labels must be contiguous");
+    TORCH_CHECK(labels_a->dim() == 1 && labels_a->size(0) == M_A,
+                "labels_a must have shape [M_A]");
+    TORCH_CHECK(labels_b->dim() == 1 && labels_b->size(0) == M_B,
+                "labels_b must have shape [M_B]");
+  }
+  
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+  
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_dot_product_ab_cuda(
+      reinterpret_cast<const half *>(data_a.data_ptr<at::Half>()),
+      reinterpret_cast<const half *>(data_b.data_ptr<at::Half>()),
+      (int)M_A, (int)M_B, (int)vec_dim,
+      has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
+      has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      scores_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+  
+  return {pair_indices_gpu, categories_gpu, scores_gpu, match_count_gpu};
+}
+
+// Sync A vs B version
+std::vector<torch::Tensor>
+dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
+                    std::optional<torch::Tensor> labels_a,
+                    std::optional<torch::Tensor> labels_b,
+                    double match_threshold, double non_match_threshold,
+                    bool is_similarity, int64_t include_flags,
+                    int64_t max_pairs, int64_t vec_dim) {
+  TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
+  TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
+  TORCH_CHECK(data_a.scalar_type() == at::kHalf, "data_a dtype must be float16");
+  TORCH_CHECK(data_b.scalar_type() == at::kHalf, "data_b dtype must be float16");
+  TORCH_CHECK(data_a.is_contiguous(), "data_a must be contiguous");
+  TORCH_CHECK(data_b.is_contiguous(), "data_b must be contiguous");
+  TORCH_CHECK(data_a.dim() == 2, "data_a must have shape [M_A, vec_dim]");
+  TORCH_CHECK(data_b.dim() == 2, "data_b must have shape [M_B, vec_dim]");
+  
+  int64_t M_A = data_a.size(0);
+  int64_t M_B = data_b.size(0);
+  int64_t actual_vec_dim_a = data_a.size(1);
+  int64_t actual_vec_dim_b = data_b.size(1);
+  
+  TORCH_CHECK(actual_vec_dim_a == actual_vec_dim_b,
+              "data_a and data_b must have same vec_dim");
+  
+  if (vec_dim == DEFAULT_DOT_VEC_DIM && actual_vec_dim_a != vec_dim) {
+    vec_dim = actual_vec_dim_a;
+  }
+  
+  auto opts_int = data_a.options().dtype(torch::kInt32);
+  auto opts_float = data_a.options().dtype(torch::kFloat32);
+  auto opts_byte = data_a.options().dtype(torch::kUInt8);
+  
+  bool has_labels = labels_a.has_value() && labels_b.has_value();
+  if (labels_a.has_value() || labels_b.has_value()) {
+    TORCH_CHECK(has_labels, "Both labels_a and labels_b must be provided, or neither");
+  }
+  if (has_labels) {
+    TORCH_CHECK(labels_a->is_cuda() && labels_b->is_cuda(), "labels must be CUDA");
+    TORCH_CHECK(labels_a->scalar_type() == at::kInt && labels_b->scalar_type() == at::kInt,
+                "labels dtype must be int32");
+    TORCH_CHECK(labels_a->is_contiguous() && labels_b->is_contiguous(),
+                "labels must be contiguous");
+    TORCH_CHECK(labels_a->dim() == 1 && labels_a->size(0) == M_A,
+                "labels_a must have shape [M_A]");
+    TORCH_CHECK(labels_b->dim() == 1 && labels_b->size(0) == M_B,
+                "labels_b must have shape [M_B]");
+  }
+  
+  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
+  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto match_count_gpu = torch::zeros({1}, opts_int);
+  
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+  
+  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
+  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
+  auto scores_cpu = torch::zeros({max_pairs}, cpu_opts_float);
+  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
+  
+  auto stream = at::cuda::getDefaultCUDAStream();
+  launch_dot_product_ab_cuda(
+      reinterpret_cast<const half *>(data_a.data_ptr<at::Half>()),
+      reinterpret_cast<const half *>(data_b.data_ptr<at::Half>()),
+      (int)M_A, (int)M_B, (int)vec_dim,
+      has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
+      has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
+      (float)match_threshold, (float)non_match_threshold,
+      is_similarity, (uint8_t)include_flags,
+      pair_indices_gpu.data_ptr<int32_t>(),
+      categories_gpu.data_ptr<uint8_t>(),
+      scores_gpu.data_ptr<float>(),
+      reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
+      (unsigned int)max_pairs, stream);
+  
+  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+                  sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+  
+  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  if (actual_count > max_pairs) {
+    actual_count = max_pairs;
+  }
+  
+  if (actual_count > 0) {
+    cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
+                    actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(categories_cpu.data_ptr(), categories_gpu.data_ptr(),
+                    actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(scores_cpu.data_ptr(), scores_gpu.data_ptr(),
+                    actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  }
+  
+  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
+  auto categories_out = categories_cpu.slice(0, 0, actual_count);
+  auto scores_out = scores_cpu.slice(0, 0, actual_count);
+  
+  return {pair_indices_out, categories_out, scores_out, match_count_cpu};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("masked_hamming_cuda", &masked_hamming_cuda,
         "Masked hamming distance with classification (CUDA)", py::arg("data"),
@@ -595,4 +966,95 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("DEFAULT_THETA_DIM") = py::int_(DEFAULT_THETA_DIM);
   m.attr("DEFAULT_D0_DIM") = py::int_(DEFAULT_D0_DIM);
   m.attr("DEFAULT_D1_DIM") = py::int_(DEFAULT_D1_DIM);
+
+  // Dot product functions
+  m.def("dot_product_cuda", &dot_product_cuda,
+        "Dot product similarity with classification (CUDA, f16)",
+        py::arg("data"),
+        py::arg("labels") = py::none(),
+        py::arg("match_threshold") = 0.5,
+        py::arg("non_match_threshold") = 0.5,
+        py::arg("is_similarity") = true,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000,
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+  m.def("dot_product_cuda_async", &dot_product_cuda_async,
+        "Async dot product similarity (returns GPU tensors, caller must sync)",
+        py::arg("data"),
+        py::arg("labels") = py::none(),
+        py::arg("match_threshold") = 0.5,
+        py::arg("non_match_threshold") = 0.5,
+        py::arg("is_similarity") = true,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000,
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+  m.def("dot_product_ab_cuda", &dot_product_ab_cuda,
+        "Dot product similarity between two sets A and B (CUDA, f16)",
+        py::arg("data_a"), py::arg("data_b"),
+        py::arg("labels_a") = py::none(),
+        py::arg("labels_b") = py::none(),
+        py::arg("match_threshold") = 0.5,
+        py::arg("non_match_threshold") = 0.5,
+        py::arg("is_similarity") = true,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000,
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+  m.def("dot_product_ab_cuda_async", &dot_product_ab_cuda_async,
+        "Async dot product A vs B (returns GPU tensors, caller must sync)",
+        py::arg("data_a"), py::arg("data_b"),
+        py::arg("labels_a") = py::none(),
+        py::arg("labels_b") = py::none(),
+        py::arg("match_threshold") = 0.5,
+        py::arg("non_match_threshold") = 0.5,
+        py::arg("is_similarity") = true,
+        py::arg("include_flags") = INCLUDE_ALL,
+        py::arg("max_pairs") = 1000000,
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+  
+  // Dense output variants (high performance)
+  m.def("dot_product_dense_cuda", [](torch::Tensor data) {
+    TORCH_CHECK(data.is_cuda(), "data must be CUDA");
+    TORCH_CHECK(data.scalar_type() == at::kHalf, "data dtype must be float16");
+    TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
+    TORCH_CHECK(data.dim() == 2, "data must have shape [M, vec_dim]");
+    
+    int64_t M = data.size(0);
+    int64_t vec_dim = data.size(1);
+    auto output = torch::zeros({M, M}, data.options().dtype(torch::kFloat32));
+    
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_dot_product_dense_cuda(
+        reinterpret_cast<const half *>(data.data_ptr<at::Half>()),
+        output.data_ptr<float>(),
+        (int)M, (int)vec_dim, stream);
+    
+    return output;
+  }, "Dense dot product similarity (returns [M, M] matrix, high performance)", py::arg("data"));
+
+  m.def("dot_product_ab_dense_cuda", [](torch::Tensor data_a, torch::Tensor data_b) {
+    TORCH_CHECK(data_a.is_cuda() && data_b.is_cuda(), "data must be CUDA");
+    TORCH_CHECK(data_a.scalar_type() == at::kHalf && data_b.scalar_type() == at::kHalf,
+                "data dtype must be float16");
+    TORCH_CHECK(data_a.is_contiguous() && data_b.is_contiguous(), "data must be contiguous");
+    TORCH_CHECK(data_a.dim() == 2 && data_b.dim() == 2, "data must be 2D");
+    TORCH_CHECK(data_a.size(1) == data_b.size(1), "vec_dim must match");
+    
+    int64_t M_A = data_a.size(0);
+    int64_t M_B = data_b.size(0);
+    int64_t vec_dim = data_a.size(1);
+    auto output = torch::zeros({M_A, M_B}, data_a.options().dtype(torch::kFloat32));
+    
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_dot_product_ab_dense_cuda(
+        reinterpret_cast<const half *>(data_a.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(data_b.data_ptr<at::Half>()),
+        output.data_ptr<float>(),
+        (int)M_A, (int)M_B, (int)vec_dim, stream);
+    
+    return output;
+  }, "Dense A vs B dot product (returns [M_A, M_B] matrix, high performance)",
+     py::arg("data_a"), py::arg("data_b"));
+
+  // Export default dot product vec_dim
+  m.attr("DEFAULT_DOT_VEC_DIM") = py::int_(DEFAULT_DOT_VEC_DIM);
 }
