@@ -385,3 +385,242 @@ def test_dot_product_non_normalized():
             f"Pair ({i},{j}): cuda={cuda_score:.4f}, ref={ref_score:.4f}"
         )
 
+
+# =============================================================================
+# Sharded Dot Product Tests
+# =============================================================================
+
+
+def test_dot_product_sharded_basic():
+    """Test sharded dot product matches non-sharded version."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    M = 64
+    vec_dim = 128
+
+    # Create normalized random data
+    data_np = np.random.randn(M, vec_dim).astype(np.float32)
+    data_np = (data_np / np.linalg.norm(data_np, axis=1, keepdims=True)).astype(np.float16)
+    data = torch.from_numpy(data_np)
+
+    max_pairs = M * (M - 1) // 2
+
+    # Run non-sharded version
+    pair_indices1, categories1, scores1, count1 = ih.dot_product_cuda(
+        data.cuda(),
+        match_threshold=100.0,
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+    )
+    torch.cuda.synchronize()
+
+    # Run sharded version with forced sharding (min_shards=4)
+    pair_indices2, categories2, scores2, count2 = ih.dot_product_sharded(
+        data,  # CPU tensor - will be transferred
+        match_threshold=100.0,
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+        min_shards=4,
+    )
+
+    n_pairs1 = count1.item()
+    n_pairs2 = count2.item()
+    assert n_pairs1 == n_pairs2, f"Count mismatch: {n_pairs1} vs {n_pairs2}"
+
+    # Build dictionaries for comparison
+    scores_dict1 = {}
+    for k in range(n_pairs1):
+        i, j = pair_indices1[k].tolist()
+        scores_dict1[(i, j)] = scores1[k].item()
+
+    scores_dict2 = {}
+    for k in range(n_pairs2):
+        i, j = pair_indices2[k].tolist()
+        scores_dict2[(i, j)] = scores2[k].item()
+
+    assert set(scores_dict1.keys()) == set(scores_dict2.keys()), "Pair sets differ"
+
+    for key in scores_dict1:
+        assert abs(scores_dict1[key] - scores_dict2[key]) < 1e-2, (
+            f"Pair {key}: {scores_dict1[key]:.4f} vs {scores_dict2[key]:.4f}"
+        )
+
+
+def test_dot_product_ab_sharded_basic():
+    """Test sharded dot_product_ab matches non-sharded version."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    M_A = 32
+    M_B = 48
+    vec_dim = 128
+
+    # Create normalized random data
+    data_a_np = np.random.randn(M_A, vec_dim).astype(np.float32)
+    data_a_np = (data_a_np / np.linalg.norm(data_a_np, axis=1, keepdims=True)).astype(np.float16)
+    data_b_np = np.random.randn(M_B, vec_dim).astype(np.float32)
+    data_b_np = (data_b_np / np.linalg.norm(data_b_np, axis=1, keepdims=True)).astype(np.float16)
+
+    data_a = torch.from_numpy(data_a_np)
+    data_b = torch.from_numpy(data_b_np)
+
+    max_pairs = M_A * M_B
+
+    # Run non-sharded version
+    pair_indices1, categories1, scores1, count1 = ih.dot_product_ab_cuda(
+        data_a.cuda(),
+        data_b.cuda(),
+        match_threshold=100.0,
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+    )
+    torch.cuda.synchronize()
+
+    # Run sharded version with forced sharding (min_shards=4)
+    pair_indices2, categories2, scores2, count2 = ih.dot_product_ab_sharded(
+        data_a,
+        data_b,
+        match_threshold=100.0,
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+        min_shards=4,
+    )
+
+    n_pairs1 = count1.item()
+    n_pairs2 = count2.item()
+    assert n_pairs1 == n_pairs2, f"Count mismatch: {n_pairs1} vs {n_pairs2}"
+
+    # Build dictionaries for comparison
+    scores_dict1 = {}
+    for k in range(n_pairs1):
+        i, j = pair_indices1[k].tolist()
+        scores_dict1[(i, j)] = scores1[k].item()
+
+    scores_dict2 = {}
+    for k in range(n_pairs2):
+        i, j = pair_indices2[k].tolist()
+        scores_dict2[(i, j)] = scores2[k].item()
+
+    assert set(scores_dict1.keys()) == set(scores_dict2.keys()), "Pair sets differ"
+
+    for key in scores_dict1:
+        assert abs(scores_dict1[key] - scores_dict2[key]) < 1e-2, (
+            f"Pair {key}: {scores_dict1[key]:.4f} vs {scores_dict2[key]:.4f}"
+        )
+
+
+def test_dot_product_sharded_with_labels():
+    """Test sharded dot product with labels for classification."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    M = 64
+    vec_dim = 128
+
+    data_np = np.random.randn(M, vec_dim).astype(np.float32)
+    data_np = (data_np / np.linalg.norm(data_np, axis=1, keepdims=True)).astype(np.float16)
+    data = torch.from_numpy(data_np)
+
+    # Create labels: 4 classes of 16 each
+    labels = torch.tensor([i // 16 for i in range(M)], dtype=torch.int32)
+
+    max_pairs = M * (M - 1) // 2
+
+    # Run sharded version
+    pair_indices, categories, scores, count = ih.dot_product_sharded(
+        data,
+        labels=labels,
+        match_threshold=0.5,
+        non_match_threshold=0.5,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+        min_shards=4,
+    )
+
+    # Verify all pairs are returned
+    assert count.item() == max_pairs
+
+    # Verify category assignment
+    for k in range(count.item()):
+        i, j = pair_indices[k].tolist()
+        cat = categories[k].item()
+        score = scores[k].item()
+        same_label = labels[i].item() == labels[j].item()
+
+        if same_label:
+            # Same identity
+            if score >= 0.5:
+                assert cat == ih.CATEGORY_TRUE_MATCH
+            else:
+                assert cat == ih.CATEGORY_FALSE_NON_MATCH
+        else:
+            # Different identity
+            if score >= 0.5:
+                assert cat == ih.CATEGORY_FALSE_MATCH
+            else:
+                assert cat == ih.CATEGORY_TRUE_NON_MATCH
+
+
+def test_dot_product_sharded_large():
+    """Test sharded dot product with larger dataset and compare to non-sharded."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    M = 256
+    vec_dim = 128
+
+    data_np = np.random.randn(M, vec_dim).astype(np.float32)
+    data_np = (data_np / np.linalg.norm(data_np, axis=1, keepdims=True)).astype(np.float16)
+    data = torch.from_numpy(data_np)
+
+    max_pairs = M * (M - 1) // 2
+
+    # Run non-sharded version for reference
+    pair_indices1, categories1, scores1, count1 = ih.dot_product_cuda(
+        data.cuda(),
+        match_threshold=100.0,  # Include all pairs
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+    )
+    torch.cuda.synchronize()
+
+    # Run sharded version with forced sharding (min_shards=8)
+    pair_indices2, categories2, scores2, count2 = ih.dot_product_sharded(
+        data,
+        match_threshold=100.0,
+        non_match_threshold=-100.0,
+        include_flags=ih.INCLUDE_ALL,
+        max_pairs=max_pairs,
+        min_shards=8,
+    )
+
+    # Verify same count
+    n_pairs1 = count1.item()
+    n_pairs2 = count2.item()
+    assert n_pairs1 == n_pairs2, f"Count mismatch: {n_pairs1} vs {n_pairs2}"
+
+    # Build dictionaries for comparison (sample a subset for speed)
+    scores_dict1 = {}
+    for k in range(min(n_pairs1, 1000)):
+        i, j = pair_indices1[k].tolist()
+        scores_dict1[(i, j)] = scores1[k].item()
+
+    scores_dict2 = {}
+    for k in range(n_pairs2):
+        i, j = pair_indices2[k].tolist()
+        if (i, j) in scores_dict1:
+            scores_dict2[(i, j)] = scores2[k].item()
+
+    # Verify scores match
+    for key in scores_dict1:
+        if key in scores_dict2:
+            assert abs(scores_dict1[key] - scores_dict2[key]) < 1e-2, (
+                f"Pair {key}: {scores_dict1[key]:.4f} vs {scores_dict2[key]:.4f}"
+            )
+

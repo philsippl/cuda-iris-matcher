@@ -38,6 +38,9 @@ from .sharding import (
     get_self_shard_info,
     get_total_shards,
     ShardConfig,
+    # Dot product sharding
+    dot_product_sharded,
+    dot_product_ab_sharded,
 )
 
 __all__ = [
@@ -60,6 +63,9 @@ __all__ = [
     "get_self_shard_info",
     "get_total_shards",
     "ShardConfig",
+    # Dot product sharding
+    "dot_product_sharded",
+    "dot_product_ab_sharded",
     # Classification constants
     "CATEGORY_TRUE_MATCH",
     "CATEGORY_FALSE_MATCH",

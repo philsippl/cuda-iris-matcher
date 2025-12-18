@@ -21,6 +21,7 @@ from .ops import (
     DEFAULT_D1_DIM,
     DEFAULT_R_DIM,
     DEFAULT_THETA_DIM,
+    DEFAULT_DOT_VEC_DIM,
     INCLUDE_ALL,
     _resolve_dims,
     pack_theta_major_cuda,
@@ -1325,4 +1326,563 @@ def get_total_shards(
             m_a, m_b, k_words, max_pairs_per_shard, total_devices, min_shards * num_hosts, max_tile_size
         )
     return len(shards)
+
+
+# =============================================================================
+# Dot Product Sharding
+# =============================================================================
+
+
+def _compute_dot_shard_configs(
+    m_a: int,
+    m_b: int,
+    vec_dim: int,
+    max_pairs_per_shard: int,
+    num_devices: int,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+) -> List[ShardConfig]:
+    """Compute shard configurations for A vs B dot product comparison.
+
+    Similar to _compute_shard_configs but adapted for f16 dot product memory layout.
+    """
+    # Estimate memory: data is f16 (2 bytes per element)
+    if max_tile_size is None:
+        if num_devices > 0:
+            available_mem = _get_available_memory(0)
+            max_tile_size = min(m_a, m_b)
+            while max_tile_size > 64:
+                # Memory: tile_a (f16) + tile_b (f16) + output buffers
+                mem_a = max_tile_size * vec_dim * 2  # f16
+                mem_b = max_tile_size * vec_dim * 2  # f16
+                mem_out = max_pairs_per_shard * 13  # indices + cat + score
+                mem_needed = mem_a + mem_b + mem_out
+                if mem_needed <= available_mem * 0.7:
+                    break
+                max_tile_size //= 2
+            max_tile_size = max(64, max_tile_size)
+        else:
+            max_tile_size = 4096
+
+    n_tiles_a = max(1, math.ceil(m_a / max_tile_size))
+    n_tiles_b = max(1, math.ceil(m_b / max_tile_size))
+    total_tiles = n_tiles_a * n_tiles_b
+
+    if total_tiles < min_shards:
+        factor = math.ceil(math.sqrt(min_shards / total_tiles))
+        n_tiles_a = max(n_tiles_a, min(n_tiles_a * factor, m_a))
+        n_tiles_b = max(n_tiles_b, min(n_tiles_b * factor, m_b))
+
+    tile_size_a = math.ceil(m_a / n_tiles_a)
+    tile_size_b = math.ceil(m_b / n_tiles_b)
+
+    tiles_with_work: List[Tuple[int, int, int, int, int]] = []
+    for i in range(n_tiles_a):
+        a_start = i * tile_size_a
+        a_end = min((i + 1) * tile_size_a, m_a)
+        if a_start >= m_a:
+            break
+        for j in range(n_tiles_b):
+            b_start = j * tile_size_b
+            b_end = min((j + 1) * tile_size_b, m_b)
+            if b_start >= m_b:
+                break
+            work = (a_end - a_start) * (b_end - b_start)
+            tiles_with_work.append((a_start, a_end, b_start, b_end, work))
+
+    if num_devices <= 1:
+        return [
+            ShardConfig(device_id=0, a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=i)
+            for i, t in enumerate(tiles_with_work)
+        ]
+
+    # Greedy load balancing
+    tiles_with_work.sort(key=lambda x: x[4], reverse=True)
+    device_work = [0] * num_devices
+    tile_assignments: List[Tuple[int, int, int, int, int, int, int]] = []
+
+    for idx, (a_start, a_end, b_start, b_end, work) in enumerate(tiles_with_work):
+        min_device = min(range(num_devices), key=lambda d: device_work[d])
+        device_work[min_device] += work
+        tile_assignments.append((a_start, a_end, b_start, b_end, work, min_device, idx))
+
+    tile_assignments.sort(key=lambda x: (x[5], x[0], x[2]))
+    return [
+        ShardConfig(device_id=t[5], a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=t[6])
+        for t in tile_assignments
+    ]
+
+
+def _compute_dot_self_shard_configs(
+    m: int,
+    vec_dim: int,
+    max_pairs_per_shard: int,
+    num_devices: int,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+) -> List[ShardConfig]:
+    """Compute shard configurations for self-comparison dot product (lower triangle only)."""
+    if max_tile_size is None:
+        if num_devices > 0:
+            available_mem = _get_available_memory(0)
+            max_tile_size = m
+            while max_tile_size > 64:
+                mem_data = max_tile_size * vec_dim * 2  # f16 data
+                mem_out = max_pairs_per_shard * 13
+                mem_needed = mem_data * 2 + mem_out  # A tile + B tile + output
+                if mem_needed <= available_mem * 0.7:
+                    break
+                max_tile_size //= 2
+            max_tile_size = max(64, max_tile_size)
+        else:
+            max_tile_size = 4096
+
+    n_tiles = max(1, math.ceil(m / max_tile_size))
+    lower_tri_tiles = n_tiles * (n_tiles + 1) // 2
+
+    if lower_tri_tiles < min_shards:
+        n_tiles = max(n_tiles, math.ceil((-1 + math.sqrt(1 + 8 * min_shards)) / 2))
+        n_tiles = min(n_tiles, m)
+
+    if num_devices > 1:
+        min_tiles_for_balance = 4 * num_devices
+        while n_tiles * (n_tiles + 1) // 2 < min_tiles_for_balance and n_tiles < m:
+            n_tiles += 1
+
+    tile_size = math.ceil(m / n_tiles)
+
+    tiles_with_work: List[Tuple[int, int, int, int, int]] = []
+    for i in range(n_tiles):
+        a_start = i * tile_size
+        a_end = min((i + 1) * tile_size, m)
+        if a_start >= m:
+            break
+        for j in range(i + 1):
+            b_start = j * tile_size
+            b_end = min((j + 1) * tile_size, m)
+            if b_start >= m:
+                break
+            if a_end > b_start:
+                a_size = a_end - a_start
+                b_size = b_end - b_start
+                if a_start == b_start:
+                    work = a_size * (a_size - 1) // 2
+                else:
+                    work = a_size * b_size
+                tiles_with_work.append((a_start, a_end, b_start, b_end, work))
+
+    if num_devices <= 1:
+        return [
+            ShardConfig(device_id=0, a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=i)
+            for i, t in enumerate(tiles_with_work)
+        ]
+
+    tiles_with_work.sort(key=lambda x: x[4], reverse=True)
+    device_work = [0] * num_devices
+    tile_assignments: List[Tuple[int, int, int, int, int, int, int]] = []
+
+    for idx, (a_start, a_end, b_start, b_end, work) in enumerate(tiles_with_work):
+        min_device = min(range(num_devices), key=lambda d: device_work[d])
+        device_work[min_device] += work
+        tile_assignments.append((a_start, a_end, b_start, b_end, work, min_device, idx))
+
+    tile_assignments.sort(key=lambda x: (x[5], x[0], x[2]))
+    return [
+        ShardConfig(device_id=t[5], a_start=t[0], a_end=t[1], b_start=t[2], b_end=t[3], global_shard_id=t[6])
+        for t in tile_assignments
+    ]
+
+
+def dot_product_ab_sharded(
+    data_a: torch.Tensor,
+    data_b: torch.Tensor,
+    labels_a: Optional[torch.Tensor] = None,
+    labels_b: Optional[torch.Tensor] = None,
+    match_threshold: float = 0.5,
+    non_match_threshold: float = 0.5,
+    is_similarity: bool = True,
+    include_flags: int = INCLUDE_ALL,
+    max_pairs: int = 1_000_000,
+    vec_dim: int = DEFAULT_DOT_VEC_DIM,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sharded version of dot_product_ab_cuda for multi-GPU and multi-host datasets.
+
+    Automatically distributes computation across all available CUDA devices.
+
+    Args:
+        data_a: CUDA or CPU float16 tensor of shape [M_A, vec_dim]
+        data_b: CUDA or CPU float16 tensor of shape [M_B, vec_dim]
+        labels_a: Optional int32 tensor of shape [M_A] with identity labels
+        labels_b: Optional int32 tensor of shape [M_B] with identity labels
+        match_threshold: Threshold for match classification (default: 0.5)
+        non_match_threshold: Threshold for non-match classification (default: 0.5)
+        is_similarity: If True (default), higher values = more similar
+        include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
+        max_pairs: Maximum total pairs to return (default: 1,000,000)
+        vec_dim: Vector dimension (default: 512)
+        min_shards: Minimum number of shards (useful for testing)
+        max_tile_size: Maximum rows per tile (None = auto)
+        host_index: Index of this host for multi-host operation
+        num_hosts: Total number of hosts
+
+    Returns:
+        Tuple of (pair_indices, categories, scores, count)
+    """
+    m_a = data_a.size(0)
+    m_b = data_b.size(0)
+    actual_vec_dim = data_a.size(1)
+    if vec_dim == DEFAULT_DOT_VEC_DIM and actual_vec_dim != vec_dim:
+        vec_dim = actual_vec_dim
+
+    num_devices = torch.cuda.device_count()
+    if num_devices == 0:
+        raise RuntimeError("No CUDA devices available")
+
+    # For single GPU without forced sharding, use non-sharded kernel
+    if num_devices == 1 and min_shards <= 1 and num_hosts == 1:
+        data_a_gpu = data_a.cuda(0) if not data_a.is_cuda else data_a
+        data_b_gpu = data_b.cuda(0) if not data_b.is_cuda else data_b
+        labels_a_gpu = labels_a.cuda(0) if labels_a is not None and not labels_a.is_cuda else labels_a
+        labels_b_gpu = labels_b.cuda(0) if labels_b is not None and not labels_b.is_cuda else labels_b
+        return _C.dot_product_ab_cuda(
+            data_a_gpu, data_b_gpu, labels_a_gpu, labels_b_gpu,
+            match_threshold, non_match_threshold, is_similarity,
+            include_flags, max_pairs, vec_dim
+        )
+
+    # Compute shard configurations
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_dot_shard_configs(
+        m_a, m_b, vec_dim, max_pairs, total_devices, min_shards * num_hosts, max_tile_size
+    )
+
+    shards = _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+    if len(shards) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    # For sparse output (max_pairs << total pairs), limit per-shard output
+    total_pairs = m_a * m_b
+    if max_pairs < total_pairs // 2:
+        # Sparse output mode: distribute max_pairs across shards with some headroom
+        max_pairs_per_shard = max(max_pairs * 2 // max(1, len(all_shards)), 10000)
+    else:
+        # Dense output mode: size for full tile output
+        max_tile_pairs = 0
+        for shard in all_shards:
+            a_size = shard.a_end - shard.a_start
+            b_size = shard.b_end - shard.b_start
+            tile_pairs = a_size * b_size
+            max_tile_pairs = max(max_tile_pairs, tile_pairs)
+        max_pairs_per_shard = max(max_tile_pairs, max_pairs // max(1, len(all_shards)), 1000)
+
+    # Ensure data is on CPU for transfers
+    data_a_cpu = data_a.cpu() if data_a.is_cuda else data_a
+    data_b_cpu = data_b.cpu() if data_b.is_cuda else data_b
+    labels_a_cpu = labels_a.cpu() if labels_a is not None and labels_a.is_cuda else labels_a
+    labels_b_cpu = labels_b.cpu() if labels_b is not None and labels_b.is_cuda else labels_b
+
+    # Determine which row ranges each GPU needs
+    device_ids = sorted(set(s.device_id for s in shards))
+    device_a_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    device_b_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    for shard in shards:
+        device_a_ranges[shard.device_id].add((shard.a_start, shard.a_end))
+        device_b_ranges[shard.device_id].add((shard.b_start, shard.b_end))
+
+    def merge_ranges(ranges: set[Tuple[int, int]]) -> Tuple[int, int]:
+        if not ranges:
+            return (0, 0)
+        return (min(r[0] for r in ranges), max(r[1] for r in ranges))
+
+    device_a_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_a_ranges.items()}
+    device_b_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_b_ranges.items()}
+
+    # Pre-transfer data to each GPU
+    def transfer_to_device(device_id: int) -> Tuple[int, torch.Tensor, torch.Tensor, int, int]:
+        a_start, a_end = device_a_row_ranges[device_id]
+        b_start, b_end = device_b_row_ranges[device_id]
+        with torch.cuda.device(device_id):
+            data_a_gpu = data_a_cpu[a_start:a_end].cuda(device_id)
+            data_b_gpu = data_b_cpu[b_start:b_end].cuda(device_id)
+            torch.cuda.synchronize(device_id)
+        return device_id, data_a_gpu, data_b_gpu, a_start, b_start
+
+    device_data: dict[int, Tuple[torch.Tensor, torch.Tensor, int, int]] = {}
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        futures = [executor.submit(transfer_to_device, d) for d in device_ids]
+        for future in as_completed(futures):
+            device_id, data_a_gpu, data_b_gpu, a_offset, b_offset = future.result()
+            device_data[device_id] = (data_a_gpu, data_b_gpu, a_offset, b_offset)
+
+    def launch_kernel(shard: ShardConfig) -> ShardKernelResult:
+        data_a_gpu, data_b_gpu, a_offset, b_offset = device_data[shard.device_id]
+
+        # Get local slices from pre-loaded data
+        local_a_start = shard.a_start - a_offset
+        local_a_end = shard.a_end - a_offset
+        local_b_start = shard.b_start - b_offset
+        local_b_end = shard.b_end - b_offset
+
+        data_a_tile = data_a_gpu[local_a_start:local_a_end]
+        data_b_tile = data_b_gpu[local_b_start:local_b_end]
+
+        labels_a_tile = None
+        labels_b_tile = None
+        if labels_a_cpu is not None and labels_b_cpu is not None:
+            labels_a_tile = labels_a_cpu[shard.a_start:shard.a_end].cuda(shard.device_id, non_blocking=True)
+            labels_b_tile = labels_b_cpu[shard.b_start:shard.b_end].cuda(shard.device_id, non_blocking=True)
+
+        indices, categories, scores, count = _C.dot_product_ab_cuda_async(
+            data_a_tile, data_b_tile,
+            labels_a_tile, labels_b_tile,
+            match_threshold, non_match_threshold,
+            is_similarity, include_flags,
+            max_pairs_per_shard, vec_dim
+        )
+
+        return ShardKernelResult(
+            shard=shard,
+            indices=indices,
+            categories=categories,
+            distances=scores,
+            count=count,
+        )
+
+    shard_results = _run_shards_async(shards, launch_kernel)
+
+    if len(shard_results) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    all_indices = []
+    all_categories = []
+    all_scores = []
+    total_count = 0
+
+    for result in shard_results:
+        remaining = max_pairs - total_count
+        if remaining <= 0:
+            break
+        take_count = min(result.count, remaining)
+        all_indices.append(result.indices[:take_count])
+        all_categories.append(result.categories[:take_count])
+        all_scores.append(result.distances[:take_count])
+        total_count += take_count
+
+    pair_indices = torch.cat(all_indices, dim=0)
+    categories = torch.cat(all_categories, dim=0)
+    scores = torch.cat(all_scores, dim=0)
+    count = torch.tensor([total_count], dtype=torch.int32)
+
+    return pair_indices, categories, scores, count
+
+
+def dot_product_sharded(
+    data: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
+    match_threshold: float = 0.5,
+    non_match_threshold: float = 0.5,
+    is_similarity: bool = True,
+    include_flags: int = INCLUDE_ALL,
+    max_pairs: int = 1_000_000,
+    vec_dim: int = DEFAULT_DOT_VEC_DIM,
+    min_shards: int = 1,
+    max_tile_size: Optional[int] = None,
+    host_index: int = 0,
+    num_hosts: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sharded version of dot_product_cuda for multi-GPU and multi-host datasets.
+
+    Computes the lower triangle (i > j) by tiling and distributing across devices.
+
+    Args:
+        data: CUDA or CPU float16 tensor of shape [M, vec_dim]
+        labels: Optional int32 tensor of shape [M] with identity labels
+        match_threshold: Threshold for match classification (default: 0.5)
+        non_match_threshold: Threshold for non-match classification (default: 0.5)
+        is_similarity: If True (default), higher values = more similar
+        include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
+        max_pairs: Maximum total pairs to return (default: 1,000,000)
+        vec_dim: Vector dimension (default: 512)
+        min_shards: Minimum number of shards (useful for testing)
+        max_tile_size: Maximum rows per tile (None = auto)
+        host_index: Index of this host for multi-host operation
+        num_hosts: Total number of hosts
+
+    Returns:
+        Tuple of (pair_indices, categories, scores, count)
+    """
+    m = data.size(0)
+    actual_vec_dim = data.size(1)
+    if vec_dim == DEFAULT_DOT_VEC_DIM and actual_vec_dim != vec_dim:
+        vec_dim = actual_vec_dim
+
+    num_devices = torch.cuda.device_count()
+    if num_devices == 0:
+        raise RuntimeError("No CUDA devices available")
+
+    # For single GPU without forced sharding, use non-sharded kernel
+    if num_devices == 1 and min_shards <= 1 and num_hosts == 1:
+        data_gpu = data.cuda(0) if not data.is_cuda else data
+        labels_gpu = labels.cuda(0) if labels is not None and not labels.is_cuda else labels
+        return _C.dot_product_cuda(
+            data_gpu, labels_gpu,
+            match_threshold, non_match_threshold, is_similarity,
+            include_flags, max_pairs, vec_dim
+        )
+
+    # Compute shard configurations for lower triangle
+    total_devices = num_devices * num_hosts
+    all_shards = _compute_dot_self_shard_configs(
+        m, vec_dim, max_pairs, total_devices, min_shards * num_hosts, max_tile_size
+    )
+
+    shards = _filter_shards_for_host(all_shards, host_index, num_hosts, num_devices)
+
+    if len(shards) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    # For sparse output (max_pairs << total pairs), limit per-shard output
+    # to avoid computing and transferring huge amounts of data we'll discard
+    total_pairs = m * (m - 1) // 2
+    if max_pairs < total_pairs // 2:
+        # Sparse output mode: distribute max_pairs across shards with some headroom
+        max_pairs_per_shard = max(max_pairs * 2 // max(1, len(all_shards)), 10000)
+    else:
+        # Dense output mode: size for full tile output
+        max_tile_pairs = 0
+        for shard in all_shards:
+            a_size = shard.a_end - shard.a_start
+            b_size = shard.b_end - shard.b_start
+            if shard.a_start == shard.b_start:
+                tile_pairs = a_size * (a_size - 1) // 2
+            else:
+                tile_pairs = a_size * b_size
+            max_tile_pairs = max(max_tile_pairs, tile_pairs)
+        max_pairs_per_shard = max(max_tile_pairs, max_pairs // max(1, len(all_shards)), 1000)
+
+    data_cpu = data.cpu() if data.is_cuda else data
+    labels_cpu = labels.cpu() if labels is not None and labels.is_cuda else labels
+
+    # Determine which row ranges each GPU needs
+    device_ids = sorted(set(s.device_id for s in shards))
+    device_ranges: dict[int, set[Tuple[int, int]]] = {d: set() for d in device_ids}
+    for shard in shards:
+        device_ranges[shard.device_id].add((shard.a_start, shard.a_end))
+        device_ranges[shard.device_id].add((shard.b_start, shard.b_end))
+
+    def merge_ranges(ranges: set[Tuple[int, int]]) -> Tuple[int, int]:
+        if not ranges:
+            return (0, 0)
+        return (min(r[0] for r in ranges), max(r[1] for r in ranges))
+
+    device_row_ranges = {d: merge_ranges(ranges) for d, ranges in device_ranges.items()}
+
+    # Pre-transfer data to each GPU
+    def transfer_to_device(device_id: int) -> Tuple[int, torch.Tensor, int]:
+        row_start, row_end = device_row_ranges[device_id]
+        with torch.cuda.device(device_id):
+            data_gpu = data_cpu[row_start:row_end].cuda(device_id)
+            torch.cuda.synchronize(device_id)
+        return device_id, data_gpu, row_start
+
+    device_data: dict[int, Tuple[torch.Tensor, int]] = {}
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        futures = [executor.submit(transfer_to_device, d) for d in device_ids]
+        for future in as_completed(futures):
+            device_id, data_gpu, row_offset = future.result()
+            device_data[device_id] = (data_gpu, row_offset)
+
+    def launch_kernel(shard: ShardConfig) -> ShardKernelResult:
+        data_gpu, row_offset = device_data[shard.device_id]
+
+        # Get local slices from pre-loaded data
+        local_a_start = shard.a_start - row_offset
+        local_a_end = shard.a_end - row_offset
+        local_b_start = shard.b_start - row_offset
+        local_b_end = shard.b_end - row_offset
+
+        data_a_tile = data_gpu[local_a_start:local_a_end]
+        data_b_tile = data_gpu[local_b_start:local_b_end]
+
+        labels_a_tile = None
+        labels_b_tile = None
+        if labels_cpu is not None:
+            labels_a_tile = labels_cpu[shard.a_start:shard.a_end].cuda(shard.device_id, non_blocking=True)
+            labels_b_tile = labels_cpu[shard.b_start:shard.b_end].cuda(shard.device_id, non_blocking=True)
+
+        indices, categories, scores, count = _C.dot_product_ab_cuda_async(
+            data_a_tile, data_b_tile,
+            labels_a_tile, labels_b_tile,
+            match_threshold, non_match_threshold,
+            is_similarity, include_flags,
+            max_pairs_per_shard, vec_dim
+        )
+
+        # For diagonal tiles, filter to lower triangle using LOCAL indices
+        if shard.a_start == shard.b_start:
+            valid_mask = indices[:, 0] > indices[:, 1]
+            indices = indices[valid_mask]
+            categories = categories[valid_mask]
+            scores = scores[valid_mask]
+            count = torch.tensor([indices.size(0)], dtype=torch.int32, device=indices.device)
+
+        return ShardKernelResult(
+            shard=shard,
+            indices=indices,
+            categories=categories,
+            distances=scores,
+            count=count,
+        )
+
+    shard_results = _run_shards_async(shards, launch_kernel)
+
+    if len(shard_results) == 0:
+        return (
+            torch.zeros((0, 2), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.uint8),
+            torch.zeros((0,), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int32),
+        )
+
+    all_indices = []
+    all_categories = []
+    all_scores = []
+    total_count = 0
+
+    for result in shard_results:
+        remaining = max_pairs - total_count
+        if remaining <= 0:
+            break
+        take_count = min(result.count, remaining)
+        all_indices.append(result.indices[:take_count])
+        all_categories.append(result.categories[:take_count])
+        all_scores.append(result.distances[:take_count])
+        total_count += take_count
+
+    pair_indices = torch.cat(all_indices, dim=0)
+    categories = torch.cat(all_categories, dim=0)
+    scores = torch.cat(all_scores, dim=0)
+    count = torch.tensor([total_count], dtype=torch.int32)
+
+    return pair_indices, categories, scores, count
 

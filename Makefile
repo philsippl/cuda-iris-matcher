@@ -106,5 +106,21 @@ pybench-dot-full: pybench-install
 pybench-dot-ab: pybench-install
 	python benchmarking/benchmark_dot_product.py --sizes 512,1024,2048,4096 --ab
 
-.PHONY: all run quick bench both compare clean test test-tc test-fallback pybench pybench-install pybench-quick pybench-full pybench-json pybench-dot pybench-dot-quick pybench-dot-full pybench-dot-ab
+# Dot product sharding scalability benchmark targets
+pybench-dot-sharding: pybench-install
+	python benchmarking/benchmark_dot_sharding.py
+
+pybench-dot-sharding-quick: pybench-install
+	python benchmarking/benchmark_dot_sharding.py --sizes 512,1024,2048 --warmup 2 --repeats 3
+
+pybench-dot-sharding-full: pybench-install
+	python benchmarking/benchmark_dot_sharding.py --sizes 1024,2048,4096,8192,16384 --warmup 3 --repeats 5
+
+pybench-dot-sharding-compare: pybench-install
+	python benchmarking/benchmark_dot_sharding.py --comparison 8192 --warmup 3 --repeats 5
+
+pybench-dot-sharding-large: pybench-install
+	python benchmarking/benchmark_dot_sharding.py --large-scale --warmup 2 --repeats 3
+
+.PHONY: all run quick bench both compare clean test test-tc test-fallback pybench pybench-install pybench-quick pybench-full pybench-json pybench-dot pybench-dot-quick pybench-dot-full pybench-dot-ab pybench-dot-sharding pybench-dot-sharding-quick pybench-dot-sharding-full pybench-dot-sharding-compare pybench-dot-sharding-large
 
