@@ -29,6 +29,10 @@ from .ops import (
     DEFAULT_DOT_VEC_DIM,
 )
 
+from .sampling import (
+    StratifiedSamplingFilter,
+)
+
 from .sharding import (
     masked_hamming_sharded,
     masked_hamming_ab_sharded,
@@ -66,6 +70,8 @@ __all__ = [
     # Dot product sharding
     "dot_product_sharded",
     "dot_product_ab_sharded",
+    # Stratified sampling
+    "StratifiedSamplingFilter",
     # Classification constants
     "CATEGORY_TRUE_MATCH",
     "CATEGORY_FALSE_MATCH",

@@ -1,10 +1,41 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
 from . import _C
+from .sampling import StratifiedSamplingFilter, SampleBinsType
+
+
+def _prepare_sampling_params(
+    sample_bins: SampleBinsType,
+) -> Tuple[int, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    """
+    Convert sample_bins to kernel parameters.
+    
+    Returns:
+        (num_bins, thresholds_tensor, probabilities_tensor, seed)
+    """
+    if sample_bins is None:
+        return 0, None, None, 0
+    
+    # Convert dict to StratifiedSamplingFilter if needed
+    if isinstance(sample_bins, dict):
+        filter_obj = StratifiedSamplingFilter(sample_bins)
+    else:
+        filter_obj = sample_bins
+    
+    # Access the sorted sample_bins (the dataclass sorts them in __post_init__)
+    thresholds_list = list(filter_obj.sample_bins.keys())
+    probabilities_list = list(filter_obj.sample_bins.values())
+    
+    num_bins = len(thresholds_list)
+    thresholds = torch.tensor(thresholds_list, dtype=torch.float32)
+    probabilities = torch.tensor(probabilities_list, dtype=torch.float32)
+    seed = filter_obj.seed if filter_obj.seed is not None else 0
+    
+    return num_bins, thresholds, probabilities, seed
 
 # Export classification constants from C++ extension
 CATEGORY_TRUE_MATCH = _C.CATEGORY_TRUE_MATCH
@@ -151,6 +182,7 @@ def masked_hamming_cuda(
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
     d1_dim: int = DEFAULT_D1_DIM,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute minimum fractional hamming distance for all pairs within a single set.
@@ -178,6 +210,14 @@ def masked_hamming_cuda(
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
         d1_dim: Second inner dimension (default: 2)
+        sample_bins: Optional stratified sampling configuration. Can be:
+                     - Dict[float, float]: Mapping of bin upper bounds to sampling probabilities
+                     - StratifiedSamplingFilter: Pre-configured filter instance
+                     - None: No sampling (return all pairs)
+                     
+                     Example for keeping more close matches:
+                         sample_bins={0.3: 1.0, 0.5: 0.1, 1.0: 0.01}
+                         Keeps 100% of [0, 0.3], 10% of (0.3, 0.5], 1% of (0.5, 1.0]
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -189,6 +229,10 @@ def masked_hamming_cuda(
     Note:
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
+        
+        When using sample_bins, the sampling is applied after category filtering
+        (include_flags). This allows you to first filter by category, then sample
+        the remaining pairs based on distance.
 
     Example:
         Basic usage with packed data:
@@ -211,6 +255,13 @@ def masked_hamming_cuda(
         ...     include_flags=ih.INCLUDE_TM | ih.INCLUDE_FM  # Only matches
         ... )
         >>> true_matches = pairs[cats == ih.CATEGORY_TRUE_MATCH]
+        
+        With stratified sampling:
+
+        >>> pairs, cats, dists, count = ih.masked_hamming_cuda(
+        ...     data, mask,
+        ...     sample_bins={0.3: 1.0, 0.5: 0.1, 1.0: 0.01}  # Keep more close matches
+        ... )
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     
@@ -218,12 +269,18 @@ def masked_hamming_cuda(
     data = _ensure_packed(data, r_dim, theta_dim, d0_dim, d1_dim)
     mask = _ensure_packed(mask, r_dim, theta_dim, d0_dim, d1_dim)
     
-    return _C.masked_hamming_cuda(
+    # Prepare kernel-level sampling parameters
+    num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
+    
+    pair_indices, categories, distances, count = _C.masked_hamming_cuda(
         data, mask, labels,
         match_threshold, non_match_threshold,
         is_similarity, include_flags, max_pairs,
-        r_dim, theta_dim, d0_dim, d1_dim
+        r_dim, theta_dim, d0_dim, d1_dim,
+        num_bins, thresholds, probabilities, seed
     )
+    
+    return pair_indices, categories, distances, count
 
 
 def masked_hamming_ab_cuda(
@@ -243,6 +300,7 @@ def masked_hamming_ab_cuda(
     theta_dim: int = DEFAULT_THETA_DIM,
     d0_dim: int = DEFAULT_D0_DIM,
     d1_dim: int = DEFAULT_D1_DIM,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute minimum fractional hamming distance between two different sets A and B.
@@ -274,6 +332,14 @@ def masked_hamming_ab_cuda(
         theta_dim: Angular dimension of iris code (default: 200)
         d0_dim: First inner dimension (default: 2)
         d1_dim: Second inner dimension (default: 2)
+        sample_bins: Optional stratified sampling configuration. Can be:
+                     - Dict[float, float]: Mapping of bin upper bounds to sampling probabilities
+                     - StratifiedSamplingFilter: Pre-configured filter instance
+                     - None: No sampling (return all pairs)
+                     
+                     Example for keeping more close matches:
+                         sample_bins={0.3: 1.0, 0.5: 0.1, 1.0: 0.01}
+                         Keeps 100% of [0, 0.3], 10% of (0.3, 0.5], 1% of (0.5, 1.0]
 
     Returns:
         Tuple of (pair_indices, categories, distances, count):
@@ -285,6 +351,10 @@ def masked_hamming_ab_cuda(
     Note:
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
+        
+        When using sample_bins, the sampling is applied after category filtering
+        (include_flags). This allows you to first filter by category, then sample
+        the remaining pairs based on distance.
 
     Example:
         Compare a gallery set against probe samples:
@@ -304,6 +374,13 @@ def masked_hamming_ab_cuda(
         ... )
         >>> # pairs[:, 0] = gallery index, pairs[:, 1] = probe index
         >>> print(f"Found {count.item()} comparisons")
+        
+        With stratified sampling:
+
+        >>> pairs, cats, dists, count = ih.masked_hamming_ab_cuda(
+        ...     gallery, gallery_mask, probe, probe_mask,
+        ...     sample_bins={0.3: 1.0, 0.5: 0.1, 1.0: 0.01}  # Keep more close matches
+        ... )
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
     
@@ -313,13 +390,19 @@ def masked_hamming_ab_cuda(
     data_b = _ensure_packed(data_b, r_dim, theta_dim, d0_dim, d1_dim)
     mask_b = _ensure_packed(mask_b, r_dim, theta_dim, d0_dim, d1_dim)
     
-    return _C.masked_hamming_ab_cuda(
+    # Prepare kernel-level sampling parameters
+    num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
+    
+    pair_indices, categories, distances, count = _C.masked_hamming_ab_cuda(
         data_a, mask_a, data_b, mask_b,
         labels_a, labels_b,
         match_threshold, non_match_threshold,
         is_similarity, include_flags, max_pairs,
-        r_dim, theta_dim, d0_dim, d1_dim
+        r_dim, theta_dim, d0_dim, d1_dim,
+        num_bins, thresholds, probabilities, seed
     )
+    
+    return pair_indices, categories, distances, count
 
 
 def pack_theta_major_cuda(
@@ -408,6 +491,7 @@ def dot_product_cuda(
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
     vec_dim: int = DEFAULT_DOT_VEC_DIM,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute dot product similarity for all pairs within a single set.
@@ -429,6 +513,14 @@ def dot_product_cuda(
                        Use INCLUDE_TM | INCLUDE_FM | ... to combine flags.
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
         vec_dim: Expected vector dimension (default: 512). Will be inferred from data if different.
+        sample_bins: Optional stratified sampling configuration. Can be:
+                     - Dict[float, float]: Mapping of bin upper bounds to sampling probabilities
+                     - StratifiedSamplingFilter: Pre-configured filter instance
+                     - None: No sampling (return all pairs)
+                     
+                     Example for similarity scores (keep more high-similarity pairs):
+                         sample_bins={0.5: 0.01, 0.8: 0.1, 1.0: 1.0}
+                         Keeps 1% of [-inf, 0.5], 10% of (0.5, 0.8], 100% of (0.8, 1.0]
 
     Returns:
         Tuple of (pair_indices, categories, scores, count):
@@ -440,6 +532,10 @@ def dot_product_cuda(
     Note:
         The returned tensors are pre-sliced to contain only the valid entries.
         Synchronization is handled internally.
+        
+        When using sample_bins, the sampling is applied after category filtering
+        (include_flags). This allows you to first filter by category, then sample
+        the remaining pairs based on similarity score.
 
     Example:
         Basic usage with f16 feature vectors:
@@ -461,12 +557,25 @@ def dot_product_cuda(
         ...     match_threshold=0.8,
         ...     include_flags=ih.INCLUDE_TM | ih.INCLUDE_FM
         ... )
+        
+        With stratified sampling (keep more high-similarity pairs):
+
+        >>> pairs, cats, scores, count = ih.dot_product_cuda(
+        ...     data,
+        ...     sample_bins={0.5: 0.01, 0.8: 0.1, 1.0: 1.0}
+        ... )
     """
-    return _C.dot_product_cuda(
+    # Prepare kernel-level sampling parameters
+    num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
+    
+    pair_indices, categories, scores, count = _C.dot_product_cuda(
         data, labels,
         match_threshold, non_match_threshold,
-        is_similarity, include_flags, max_pairs, vec_dim
+        is_similarity, include_flags, max_pairs, vec_dim,
+        num_bins, thresholds, probabilities, seed
     )
+    
+    return pair_indices, categories, scores, count
 
 
 def dot_product_ab_cuda(
@@ -480,6 +589,7 @@ def dot_product_ab_cuda(
     include_flags: int = INCLUDE_ALL,
     max_pairs: int = 1_000_000,
     vec_dim: int = DEFAULT_DOT_VEC_DIM,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute dot product similarity between two different sets A and B.
@@ -501,6 +611,14 @@ def dot_product_ab_cuda(
         include_flags: Bitmask of categories to include (default: INCLUDE_ALL)
         max_pairs: Maximum number of pairs to return (default: 1,000,000)
         vec_dim: Expected vector dimension (default: 512). Will be inferred from data if different.
+        sample_bins: Optional stratified sampling configuration. Can be:
+                     - Dict[float, float]: Mapping of bin upper bounds to sampling probabilities
+                     - StratifiedSamplingFilter: Pre-configured filter instance
+                     - None: No sampling (return all pairs)
+                     
+                     Example for similarity scores (keep more high-similarity pairs):
+                         sample_bins={0.5: 0.01, 0.8: 0.1, 1.0: 1.0}
+                         Keeps 1% of [-inf, 0.5], 10% of (0.5, 0.8], 100% of (0.8, 1.0]
 
     Returns:
         Tuple of (pair_indices, categories, scores, count):
@@ -508,6 +626,11 @@ def dot_product_ab_cuda(
         - categories: [N] uint8 - category codes (0=TM, 1=FM, 2=FNM, 3=TNM, 255=unclassified)
         - scores: [N] float32 - dot product similarity scores
         - count: [1] int32 - actual number of pairs
+        
+    Note:
+        When using sample_bins, the sampling is applied after category filtering
+        (include_flags). This allows you to first filter by category, then sample
+        the remaining pairs based on similarity score.
 
     Example:
         Compare a gallery set against probe samples:
@@ -526,10 +649,23 @@ def dot_product_ab_cuda(
         ...     match_threshold=0.8
         ... )
         >>> # pairs[:, 0] = gallery index, pairs[:, 1] = probe index
+        
+        With stratified sampling (keep more high-similarity pairs):
+
+        >>> pairs, cats, scores, count = ih.dot_product_ab_cuda(
+        ...     gallery, probe,
+        ...     sample_bins={0.5: 0.01, 0.8: 0.1, 1.0: 1.0}
+        ... )
     """
-    return _C.dot_product_ab_cuda(
+    # Prepare kernel-level sampling parameters
+    num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
+    
+    pair_indices, categories, scores, count = _C.dot_product_ab_cuda(
         data_a, data_b,
         labels_a, labels_b,
         match_threshold, non_match_threshold,
-        is_similarity, include_flags, max_pairs, vec_dim
+        is_similarity, include_flags, max_pairs, vec_dim,
+        num_bins, thresholds, probabilities, seed
     )
+    
+    return pair_indices, categories, scores, count

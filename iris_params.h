@@ -151,3 +151,61 @@ constexpr uint8_t INCLUDE_FM = 0x2;  // Include False Matches
 constexpr uint8_t INCLUDE_FNM = 0x4; // Include False Non-Matches
 constexpr uint8_t INCLUDE_TNM = 0x8; // Include True Non-Matches
 constexpr uint8_t INCLUDE_ALL = 0xF; // Include all categories
+
+// ----------------- Stratified Sampling Configuration -----------------
+// Maximum number of bins for stratified sampling
+constexpr int MAX_SAMPLE_BINS = 8;
+
+struct SamplingConfig {
+  int num_bins;                         // Number of active bins (0 = no sampling)
+  float thresholds[MAX_SAMPLE_BINS];    // Bin upper bounds (sorted ascending)
+  float probabilities[MAX_SAMPLE_BINS]; // Sampling probability for each bin [0, 1]
+  uint64_t seed;                        // RNG seed for reproducibility
+
+  // Check if sampling is enabled
+  __host__ __device__ bool enabled() const { return num_bins > 0; }
+
+  // Get sampling probability for a given score
+  __device__ float get_probability(float score) const {
+    // Find the bin this score falls into (first threshold >= score)
+    for (int i = 0; i < num_bins; i++) {
+      if (score <= thresholds[i]) {
+        return probabilities[i];
+      }
+    }
+    // Score exceeds all thresholds, use last bin's probability
+    return probabilities[num_bins - 1];
+  }
+
+  // Fast hash-based RNG for sampling decisions
+  // Uses pair indices to generate deterministic but pseudo-random result
+  __device__ bool should_sample(float score, int row, int col) const {
+    if (!enabled()) return true;
+    
+    float prob = get_probability(score);
+    if (prob >= 1.0f) return true;
+    if (prob <= 0.0f) return false;
+    
+    // Hash-based RNG: combine seed with pair indices
+    // Using a variant of xxHash for speed
+    uint64_t h = seed;
+    h ^= (uint64_t)row * 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)col * 0xC6BC279692B5C323ULL;
+    h = h * 0x87C37B91114253D5ULL;
+    h ^= h >> 33;
+    h = h * 0xC2B2AE3D27D4EB4FULL;
+    h ^= h >> 29;
+    
+    // Convert to float in [0, 1)
+    float rand_val = (h & 0xFFFFFFFFULL) / 4294967296.0f;
+    return rand_val < prob;
+  }
+  
+  // Create disabled sampling config
+  __host__ static SamplingConfig disabled() {
+    SamplingConfig cfg;
+    cfg.num_bins = 0;
+    cfg.seed = 0;
+    return cfg;
+  }
+};
