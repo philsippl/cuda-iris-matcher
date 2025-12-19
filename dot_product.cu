@@ -45,6 +45,7 @@ __device__ __forceinline__ void emit_tile_results(
     const int32_t* labels, const int32_t* labels_b,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t* pair_indices, uint8_t* categories, float* out_scores,
     unsigned int* match_count, unsigned int max_pairs,
     int lane) {
@@ -89,6 +90,11 @@ __device__ __forceinline__ void emit_tile_results(
     } else {
       category = 0xFF;
       emit = true;
+    }
+    
+    // Apply stratified sampling if enabled
+    if (emit && sampling.enabled()) {
+      emit = sampling.should_sample(score, gi, gj);
     }
     
     if (emit) {
@@ -360,6 +366,7 @@ dot_product_kernel(
     const int32_t *__restrict__ labels,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *__restrict__ pair_indices,
     uint8_t *__restrict__ categories,
     float *__restrict__ out_scores,
@@ -452,7 +459,7 @@ dot_product_kernel(
       
       emit_tile_results(c_frag[tm][tn], my_tile_smem, tile_row, tile_col, M, M, true,
                        labels, nullptr, match_threshold, non_match_threshold,
-                       is_similarity, include_flags, pair_indices, categories, out_scores,
+                       is_similarity, include_flags, sampling, pair_indices, categories, out_scores,
                        match_count, max_pairs, lane);
     }
   }
@@ -468,6 +475,7 @@ dot_product_ab_kernel(
     const int32_t *__restrict__ labels_b,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *__restrict__ pair_indices,
     uint8_t *__restrict__ categories,
     float *__restrict__ out_scores,
@@ -557,7 +565,7 @@ dot_product_ab_kernel(
       
       emit_tile_results(c_frag[tm][tn], my_tile_smem, tile_row, tile_col, M_A, M_B, false,
                        labels_a, labels_b, match_threshold, non_match_threshold,
-                       is_similarity, include_flags, pair_indices, categories, out_scores,
+                       is_similarity, include_flags, sampling, pair_indices, categories, out_scores,
                        match_count, max_pairs, lane);
     }
   }
@@ -588,6 +596,7 @@ extern "C" void launch_dot_product_cuda(
     const int32_t *dLabels,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories,
     float *dOutScores, unsigned int *dMatchCount,
     unsigned int max_pairs, cudaStream_t stream) {
@@ -599,7 +608,7 @@ extern "C" void launch_dot_product_cuda(
   
   dot_product_kernel<<<grid, block, smem, stream>>>(
       dData, M, vec_dim, dLabels, match_threshold, non_match_threshold,
-      is_similarity, include_flags, dPairIndices, dCategories, dOutScores,
+      is_similarity, include_flags, sampling, dPairIndices, dCategories, dOutScores,
       dMatchCount, max_pairs);
 }
 
@@ -609,6 +618,7 @@ extern "C" void launch_dot_product_ab_cuda(
     const int32_t *dLabels_A, const int32_t *dLabels_B,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories,
     float *dOutScores, unsigned int *dMatchCount,
     unsigned int max_pairs, cudaStream_t stream) {
@@ -621,6 +631,6 @@ extern "C" void launch_dot_product_ab_cuda(
   dot_product_ab_kernel<<<grid, block, smem, stream>>>(
       dData_A, dData_B, M_A, M_B, vec_dim,
       dLabels_A, dLabels_B, match_threshold, non_match_threshold,
-      is_similarity, include_flags, dPairIndices, dCategories, dOutScores,
+      is_similarity, include_flags, sampling, dPairIndices, dCategories, dOutScores,
       dMatchCount, max_pairs);
 }

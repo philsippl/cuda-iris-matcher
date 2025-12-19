@@ -26,6 +26,7 @@ from .ops import (
     _resolve_dims,
     pack_theta_major_cuda,
 )
+from .sampling import SampleBinsType, apply_stratified_sampling
 
 
 @dataclass
@@ -537,6 +538,7 @@ def masked_hamming_ab_sharded(
     max_tile_size: Optional[int] = None,
     host_index: int = 0,
     num_hosts: int = 1,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sharded version of masked_hamming_ab_cuda for multi-GPU and multi-host datasets.
 
@@ -640,12 +642,18 @@ def masked_hamming_ab_sharded(
             labels_a_gpu = labels_a.cuda(primary_device) if not labels_a.is_cuda else labels_a
         if labels_b is not None:
             labels_b_gpu = labels_b.cuda(primary_device) if not labels_b.is_cuda else labels_b
-        return _C.masked_hamming_ab_cuda(
+        pair_indices, categories, distances, count = _C.masked_hamming_ab_cuda(
             data_a_gpu, mask_a_gpu, data_b_gpu, mask_b_gpu,
             labels_a_gpu, labels_b_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, r_dim, theta_dim, d0_dim, d1_dim
         )
+        # Apply stratified sampling if configured
+        if sample_bins is not None:
+            pair_indices, categories, distances, count = apply_stratified_sampling(
+                pair_indices, categories, distances, sample_bins
+            )
+        return pair_indices, categories, distances, count
 
     # Compute shard configurations
     # For multi-host, compute shards as if all hosts' GPUs were available
@@ -819,6 +827,12 @@ def masked_hamming_ab_sharded(
     distances = torch.cat(all_distances, dim=0)
     count = torch.tensor([total_count], dtype=torch.int32)
 
+    # Apply stratified sampling if configured
+    if sample_bins is not None:
+        pair_indices, categories, distances, count = apply_stratified_sampling(
+            pair_indices, categories, distances, sample_bins
+        )
+
     return pair_indices, categories, distances, count
 
 
@@ -840,6 +854,7 @@ def masked_hamming_sharded(
     max_tile_size: Optional[int] = None,
     host_index: int = 0,
     num_hosts: int = 1,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sharded version of masked_hamming_cuda for multi-GPU and multi-host datasets.
 
@@ -934,11 +949,17 @@ def masked_hamming_sharded(
         labels_gpu = None
         if labels is not None:
             labels_gpu = labels.cuda(primary_device) if not labels.is_cuda else labels
-        return _C.masked_hamming_cuda(
+        pair_indices, categories, distances, count = _C.masked_hamming_cuda(
             data_gpu, mask_gpu, labels_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, r_dim, theta_dim, d0_dim, d1_dim
         )
+        # Apply stratified sampling if configured
+        if sample_bins is not None:
+            pair_indices, categories, distances, count = apply_stratified_sampling(
+                pair_indices, categories, distances, sample_bins
+            )
+        return pair_indices, categories, distances, count
 
     # Compute shard configurations for lower triangle
     # For multi-host, compute shards as if all hosts' GPUs were available
@@ -1122,6 +1143,12 @@ def masked_hamming_sharded(
     categories = torch.cat(all_categories, dim=0)
     distances = torch.cat(all_distances, dim=0)
     count = torch.tensor([total_count], dtype=torch.int32)
+
+    # Apply stratified sampling if configured
+    if sample_bins is not None:
+        pair_indices, categories, distances, count = apply_stratified_sampling(
+            pair_indices, categories, distances, sample_bins
+        )
 
     return pair_indices, categories, distances, count
 
@@ -1508,6 +1535,7 @@ def dot_product_ab_sharded(
     max_tile_size: Optional[int] = None,
     host_index: int = 0,
     num_hosts: int = 1,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sharded version of dot_product_ab_cuda for multi-GPU and multi-host datasets.
 
@@ -1548,11 +1576,17 @@ def dot_product_ab_sharded(
         data_b_gpu = data_b.cuda(0) if not data_b.is_cuda else data_b
         labels_a_gpu = labels_a.cuda(0) if labels_a is not None and not labels_a.is_cuda else labels_a
         labels_b_gpu = labels_b.cuda(0) if labels_b is not None and not labels_b.is_cuda else labels_b
-        return _C.dot_product_ab_cuda(
+        pair_indices, categories, scores, count = _C.dot_product_ab_cuda(
             data_a_gpu, data_b_gpu, labels_a_gpu, labels_b_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, vec_dim
         )
+        # Apply stratified sampling if configured
+        if sample_bins is not None:
+            pair_indices, categories, scores, count = apply_stratified_sampling(
+                pair_indices, categories, scores, sample_bins
+            )
+        return pair_indices, categories, scores, count
 
     # Compute shard configurations
     total_devices = num_devices * num_hosts
@@ -1688,6 +1722,12 @@ def dot_product_ab_sharded(
     scores = torch.cat(all_scores, dim=0)
     count = torch.tensor([total_count], dtype=torch.int32)
 
+    # Apply stratified sampling if configured
+    if sample_bins is not None:
+        pair_indices, categories, scores, count = apply_stratified_sampling(
+            pair_indices, categories, scores, sample_bins
+        )
+
     return pair_indices, categories, scores, count
 
 
@@ -1704,6 +1744,7 @@ def dot_product_sharded(
     max_tile_size: Optional[int] = None,
     host_index: int = 0,
     num_hosts: int = 1,
+    sample_bins: SampleBinsType = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sharded version of dot_product_cuda for multi-GPU and multi-host datasets.
 
@@ -1739,11 +1780,17 @@ def dot_product_sharded(
     if num_devices == 1 and min_shards <= 1 and num_hosts == 1:
         data_gpu = data.cuda(0) if not data.is_cuda else data
         labels_gpu = labels.cuda(0) if labels is not None and not labels.is_cuda else labels
-        return _C.dot_product_cuda(
+        pair_indices, categories, scores, count = _C.dot_product_cuda(
             data_gpu, labels_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, vec_dim
         )
+        # Apply stratified sampling if configured
+        if sample_bins is not None:
+            pair_indices, categories, scores, count = apply_stratified_sampling(
+                pair_indices, categories, scores, sample_bins
+            )
+        return pair_indices, categories, scores, count
 
     # Compute shard configurations for lower triangle
     total_devices = num_devices * num_hosts
@@ -1883,6 +1930,12 @@ def dot_product_sharded(
     categories = torch.cat(all_categories, dim=0)
     scores = torch.cat(all_scores, dim=0)
     count = torch.tensor([total_count], dtype=torch.int32)
+
+    # Apply stratified sampling if configured
+    if sample_bins is not None:
+        pair_indices, categories, scores, count = apply_stratified_sampling(
+            pair_indices, categories, scores, sample_bins
+        )
 
     return pair_indices, categories, scores, count
 

@@ -169,6 +169,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
     const int32_t *__restrict__ labels, // [M] or nullptr (no classification)
     float match_threshold, float non_match_threshold, bool is_similarity,
     uint8_t include_flags,
+    // Stratified sampling parameters
+    SamplingConfig sampling,
     // Output arrays (sparse format)
     int32_t *__restrict__ pair_indices, // [max_pairs, 2]
     uint8_t *__restrict__ categories,   // [max_pairs]
@@ -449,6 +451,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1) min_hamming_kernel(
           emit = true;
         }
 
+        // Apply stratified sampling if enabled
+        if (emit && sampling.enabled()) {
+          emit = sampling.should_sample(val, gi, gj);
+        }
+
         if (emit) {
           unsigned int idx = atomicAdd(match_count, 1);
           if (idx < max_pairs) {
@@ -685,6 +692,7 @@ extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
     int r_dim, int theta_dim, const int32_t *dLabels, float match_threshold,
     float non_match_threshold, bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
     unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream) {
   IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim);
@@ -703,7 +711,7 @@ extern "C" void launch_masked_hamming_cuda(
   min_hamming_kernel<<<grid, block, smem, stream>>>(
       dPremasked, dMask, M, cfg.k_words, cfg.k_chunks, cfg.words_per_shift,
       dLabels, match_threshold, non_match_threshold, is_similarity,
-      include_flags, dPairIndices, dCategories, dOutDistances, dMatchCount,
+      include_flags, sampling, dPairIndices, dCategories, dOutDistances, dMatchCount,
       max_pairs);
 }
 
@@ -726,6 +734,8 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
         const int32_t *__restrict__ labels_B, // [M_B] or nullptr
         float match_threshold, float non_match_threshold, bool is_similarity,
         uint8_t include_flags,
+        // Stratified sampling parameters
+        SamplingConfig sampling,
         // Output arrays (sparse format)
         int32_t *__restrict__ pair_indices, // [max_pairs, 2]
         uint8_t *__restrict__ categories,   // [max_pairs]
@@ -1006,6 +1016,11 @@ __global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 1)
           emit = true;
         }
 
+        // Apply stratified sampling if enabled
+        if (emit && sampling.enabled()) {
+          emit = sampling.should_sample(val, gi, gj);
+        }
+
         if (emit) {
           unsigned int idx = atomicAdd(match_count, 1);
           if (idx < max_pairs) {
@@ -1033,9 +1048,9 @@ extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
     int M_A, int M_B, int r_dim, int theta_dim, const int32_t *dLabels_A,
     const int32_t *dLabels_B, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
-    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream) {
+    bool is_similarity, uint8_t include_flags, SamplingConfig sampling,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream) {
   IrisConfig cfg = IrisConfig::from_dims(r_dim, theta_dim);
 
   // Preprocess both A and B sets
@@ -1056,6 +1071,6 @@ extern "C" void launch_masked_hamming_ab_cuda(
   min_hamming_ab_kernel<<<grid, block, smem, stream>>>(
       dPremasked_A, dMask_A, dPremasked_B, dMask_B, M_A, M_B, cfg.k_words,
       cfg.k_chunks, cfg.words_per_shift, dLabels_A, dLabels_B, match_threshold,
-      non_match_threshold, is_similarity, include_flags, dPairIndices,
+      non_match_threshold, is_similarity, include_flags, sampling, dPairIndices,
       dCategories, dOutDistances, dMatchCount, max_pairs);
 }

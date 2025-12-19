@@ -13,6 +13,7 @@ extern "C" void launch_masked_hamming_cuda(
     const uint32_t *dData, const uint32_t *dMask, uint32_t *dPremasked, int M,
     int r_dim, int theta_dim, const int32_t *dLabels, float match_threshold,
     float non_match_threshold, bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
     unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream);
 
@@ -21,9 +22,9 @@ extern "C" void launch_masked_hamming_ab_cuda(
     const uint32_t *dData_B, const uint32_t *dMask_B, uint32_t *dPremasked_B,
     int M_A, int M_B, int r_dim, int theta_dim, const int32_t *dLabels_A,
     const int32_t *dLabels_B, float match_threshold, float non_match_threshold,
-    bool is_similarity, uint8_t include_flags, int32_t *dPairIndices,
-    uint8_t *dCategories, float *dOutDistances, unsigned int *dMatchCount,
-    unsigned int max_pairs, cudaStream_t stream);
+    bool is_similarity, uint8_t include_flags, SamplingConfig sampling,
+    int32_t *dPairIndices, uint8_t *dCategories, float *dOutDistances,
+    unsigned int *dMatchCount, unsigned int max_pairs, cudaStream_t stream);
 
 extern "C" void launch_pack_theta_major_cuda(uint8_t *data, int M, int r_dim,
                                              int theta_dim, int d0_dim,
@@ -41,6 +42,7 @@ extern "C" void launch_dot_product_cuda(
     const int32_t *dLabels,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories,
     float *dOutScores, unsigned int *dMatchCount,
     unsigned int max_pairs, cudaStream_t stream);
@@ -51,6 +53,7 @@ extern "C" void launch_dot_product_ab_cuda(
     const int32_t *dLabels_A, const int32_t *dLabels_B,
     float match_threshold, float non_match_threshold,
     bool is_similarity, uint8_t include_flags,
+    SamplingConfig sampling,
     int32_t *dPairIndices, uint8_t *dCategories,
     float *dOutScores, unsigned int *dMatchCount,
     unsigned int max_pairs, cudaStream_t stream);
@@ -63,6 +66,36 @@ extern "C" void launch_dot_product_ab_dense_cuda(
     const half *dData_A, const half *dData_B, float *dOutput,
     int M_A, int M_B, int vec_dim, cudaStream_t stream);
 
+// Helper to construct SamplingConfig from Python parameters
+SamplingConfig make_sampling_config(
+    int64_t num_bins,
+    std::optional<torch::Tensor> thresholds,
+    std::optional<torch::Tensor> probabilities,
+    int64_t seed) {
+  SamplingConfig cfg;
+  cfg.num_bins = (int)num_bins;
+  cfg.seed = (uint64_t)seed;
+  
+  if (num_bins > 0 && thresholds.has_value() && probabilities.has_value()) {
+    TORCH_CHECK(thresholds->dim() == 1 && thresholds->size(0) >= num_bins,
+                "thresholds must have at least num_bins elements");
+    TORCH_CHECK(probabilities->dim() == 1 && probabilities->size(0) >= num_bins,
+                "probabilities must have at least num_bins elements");
+    
+    auto thresh_cpu = thresholds->cpu().to(torch::kFloat32);
+    auto prob_cpu = probabilities->cpu().to(torch::kFloat32);
+    
+    for (int i = 0; i < num_bins && i < MAX_SAMPLE_BINS; i++) {
+      cfg.thresholds[i] = thresh_cpu[i].item<float>();
+      cfg.probabilities[i] = prob_cpu[i].item<float>();
+    }
+  } else {
+    cfg.num_bins = 0;  // Disable sampling if parameters not provided
+  }
+  
+  return cfg;
+}
+
 // Async version: returns GPU tensors without synchronization
 // Caller must synchronize before reading results
 std::vector<torch::Tensor>
@@ -71,7 +104,11 @@ masked_hamming_cuda_async(torch::Tensor data, torch::Tensor mask,
                           double match_threshold, double non_match_threshold,
                           bool is_similarity, int64_t include_flags,
                           int64_t max_pairs, int64_t r_dim, int64_t theta_dim,
-                          int64_t d0_dim, int64_t d1_dim) {
+                          int64_t d0_dim, int64_t d1_dim,
+                          int64_t sampling_num_bins,
+                          std::optional<torch::Tensor> sampling_thresholds,
+                          std::optional<torch::Tensor> sampling_probabilities,
+                          int64_t sampling_seed) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kInt, "data dtype must be int32");
@@ -116,6 +153,10 @@ masked_hamming_cuda_async(torch::Tensor data, torch::Tensor mask,
   auto distances_gpu = torch::zeros({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
 
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+
   // Use current stream (respects torch.cuda.stream() context)
   auto stream = at::cuda::getCurrentCUDAStream();
   launch_masked_hamming_cuda(
@@ -125,7 +166,7 @@ masked_hamming_cuda_async(torch::Tensor data, torch::Tensor mask,
       (int)r_dim, (int)theta_dim,
       labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold, is_similarity,
-      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      (uint8_t)include_flags, sampling, pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
@@ -140,7 +181,11 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
                     std::optional<torch::Tensor> labels, double match_threshold,
                     double non_match_threshold, bool is_similarity,
                     int64_t include_flags, int64_t max_pairs, int64_t r_dim,
-                    int64_t theta_dim, int64_t d0_dim, int64_t d1_dim) {
+                    int64_t theta_dim, int64_t d0_dim, int64_t d1_dim,
+                    int64_t sampling_num_bins,
+                    std::optional<torch::Tensor> sampling_thresholds,
+                    std::optional<torch::Tensor> sampling_probabilities,
+                    int64_t sampling_seed) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kInt, "data dtype must be int32");
@@ -204,6 +249,10 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
   auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_masked_hamming_cuda(
       reinterpret_cast<uint32_t *>(data.data_ptr<int>()),
@@ -212,7 +261,7 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
       (int)r_dim, (int)theta_dim,
       labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold, is_similarity,
-      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      (uint8_t)include_flags, sampling, pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
@@ -257,7 +306,11 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda_async(
     std::optional<torch::Tensor> labels_b, double match_threshold,
     double non_match_threshold, bool is_similarity, int64_t include_flags,
     int64_t max_pairs, int64_t r_dim, int64_t theta_dim, int64_t d0_dim,
-    int64_t d1_dim) {
+    int64_t d1_dim,
+    int64_t sampling_num_bins,
+    std::optional<torch::Tensor> sampling_thresholds,
+    std::optional<torch::Tensor> sampling_probabilities,
+    int64_t sampling_seed) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(mask_a.is_cuda(), "mask_a must be CUDA");
   TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
@@ -323,6 +376,10 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda_async(
   auto distances_gpu = torch::zeros({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
 
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+
   // Use current stream (respects torch.cuda.stream() context)
   auto stream = at::cuda::getCurrentCUDAStream();
   launch_masked_hamming_ab_cuda(
@@ -336,7 +393,7 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda_async(
       has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
       has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold, is_similarity,
-      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      (uint8_t)include_flags, sampling, pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
@@ -352,7 +409,11 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
     std::optional<torch::Tensor> labels_b, double match_threshold,
     double non_match_threshold, bool is_similarity, int64_t include_flags,
     int64_t max_pairs, int64_t r_dim, int64_t theta_dim, int64_t d0_dim,
-    int64_t d1_dim) {
+    int64_t d1_dim,
+    int64_t sampling_num_bins,
+    std::optional<torch::Tensor> sampling_thresholds,
+    std::optional<torch::Tensor> sampling_probabilities,
+    int64_t sampling_seed) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(mask_a.is_cuda(), "mask_a must be CUDA");
   TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
@@ -437,6 +498,10 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
   auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
   auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_masked_hamming_ab_cuda(
       reinterpret_cast<uint32_t *>(data_a.data_ptr<int>()),
@@ -449,7 +514,7 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
       has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
       has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold, is_similarity,
-      (uint8_t)include_flags, pair_indices_gpu.data_ptr<int32_t>(),
+      (uint8_t)include_flags, sampling, pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(), distances_gpu.data_ptr<float>(),
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
@@ -568,7 +633,11 @@ dot_product_cuda_async(torch::Tensor data,
                        std::optional<torch::Tensor> labels,
                        double match_threshold, double non_match_threshold,
                        bool is_similarity, int64_t include_flags,
-                       int64_t max_pairs, int64_t vec_dim) {
+                       int64_t max_pairs, int64_t vec_dim,
+                       int64_t sampling_num_bins,
+                       std::optional<torch::Tensor> sampling_thresholds,
+                       std::optional<torch::Tensor> sampling_probabilities,
+                       int64_t sampling_seed) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kHalf, "data dtype must be float16");
   TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
@@ -597,6 +666,10 @@ dot_product_cuda_async(torch::Tensor data,
                 "labels must have shape [M]");
   }
   
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+  
   // GPU buffers for output
   auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
   auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
@@ -609,7 +682,7 @@ dot_product_cuda_async(torch::Tensor data,
       (int)M, (int)vec_dim,
       labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
+      is_similarity, (uint8_t)include_flags, sampling,
       pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(),
       scores_gpu.data_ptr<float>(),
@@ -625,7 +698,11 @@ dot_product_cuda(torch::Tensor data,
                  std::optional<torch::Tensor> labels,
                  double match_threshold, double non_match_threshold,
                  bool is_similarity, int64_t include_flags,
-                 int64_t max_pairs, int64_t vec_dim) {
+                 int64_t max_pairs, int64_t vec_dim,
+                 int64_t sampling_num_bins,
+                 std::optional<torch::Tensor> sampling_thresholds,
+                 std::optional<torch::Tensor> sampling_probabilities,
+                 int64_t sampling_seed) {
   TORCH_CHECK(data.is_cuda(), "data must be CUDA");
   TORCH_CHECK(data.scalar_type() == at::kHalf, "data dtype must be float16");
   TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
@@ -651,6 +728,10 @@ dot_product_cuda(torch::Tensor data,
     TORCH_CHECK(labels->dim() == 1 && labels->size(0) == M,
                 "labels must have shape [M]");
   }
+  
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
   
   auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
   auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
@@ -682,7 +763,7 @@ dot_product_cuda(torch::Tensor data,
       (int)M, (int)vec_dim,
       labels.has_value() ? labels->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
+      is_similarity, (uint8_t)include_flags, sampling,
       pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(),
       scores_gpu.data_ptr<float>(),
@@ -722,7 +803,11 @@ dot_product_ab_cuda_async(torch::Tensor data_a, torch::Tensor data_b,
                           std::optional<torch::Tensor> labels_b,
                           double match_threshold, double non_match_threshold,
                           bool is_similarity, int64_t include_flags,
-                          int64_t max_pairs, int64_t vec_dim) {
+                          int64_t max_pairs, int64_t vec_dim,
+                          int64_t sampling_num_bins,
+                          std::optional<torch::Tensor> sampling_thresholds,
+                          std::optional<torch::Tensor> sampling_probabilities,
+                          int64_t sampling_seed) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
   TORCH_CHECK(data_a.scalar_type() == at::kHalf, "data_a dtype must be float16");
@@ -764,6 +849,10 @@ dot_product_ab_cuda_async(torch::Tensor data_a, torch::Tensor data_b,
                 "labels_b must have shape [M_B]");
   }
   
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+  
   auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
   auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
   auto scores_gpu = torch::zeros({max_pairs}, opts_float);
@@ -777,7 +866,7 @@ dot_product_ab_cuda_async(torch::Tensor data_a, torch::Tensor data_b,
       has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
       has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
+      is_similarity, (uint8_t)include_flags, sampling,
       pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(),
       scores_gpu.data_ptr<float>(),
@@ -794,7 +883,11 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
                     std::optional<torch::Tensor> labels_b,
                     double match_threshold, double non_match_threshold,
                     bool is_similarity, int64_t include_flags,
-                    int64_t max_pairs, int64_t vec_dim) {
+                    int64_t max_pairs, int64_t vec_dim,
+                    int64_t sampling_num_bins,
+                    std::optional<torch::Tensor> sampling_thresholds,
+                    std::optional<torch::Tensor> sampling_probabilities,
+                    int64_t sampling_seed) {
   TORCH_CHECK(data_a.is_cuda(), "data_a must be CUDA");
   TORCH_CHECK(data_b.is_cuda(), "data_b must be CUDA");
   TORCH_CHECK(data_a.scalar_type() == at::kHalf, "data_a dtype must be float16");
@@ -859,6 +952,10 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
   auto scores_cpu = torch::zeros({max_pairs}, cpu_opts_float);
   auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
   
+  // Construct sampling config
+  SamplingConfig sampling = make_sampling_config(
+      sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
+  
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_dot_product_ab_cuda(
       reinterpret_cast<const half *>(data_a.data_ptr<at::Half>()),
@@ -867,7 +964,7 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
       has_labels ? labels_a->data_ptr<int32_t>() : nullptr,
       has_labels ? labels_b->data_ptr<int32_t>() : nullptr,
       (float)match_threshold, (float)non_match_threshold,
-      is_similarity, (uint8_t)include_flags,
+      is_similarity, (uint8_t)include_flags, sampling,
       pair_indices_gpu.data_ptr<int32_t>(),
       categories_gpu.data_ptr<uint8_t>(),
       scores_gpu.data_ptr<float>(),
@@ -908,7 +1005,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
         py::arg("r_dim") = DEFAULT_R_DIM,
         py::arg("theta_dim") = DEFAULT_THETA_DIM,
-        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("masked_hamming_cuda_async", &masked_hamming_cuda_async,
         "Async masked hamming distance (returns GPU tensors, caller must sync)",
         py::arg("data"), py::arg("mask"), py::arg("labels") = py::none(),
@@ -917,7 +1018,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
         py::arg("r_dim") = DEFAULT_R_DIM,
         py::arg("theta_dim") = DEFAULT_THETA_DIM,
-        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("masked_hamming_ab_cuda", &masked_hamming_ab_cuda,
         "Masked hamming distance between two sets A and B with classification "
         "(CUDA)",
@@ -928,7 +1033,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
         py::arg("r_dim") = DEFAULT_R_DIM,
         py::arg("theta_dim") = DEFAULT_THETA_DIM,
-        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("masked_hamming_ab_cuda_async", &masked_hamming_ab_cuda_async,
         "Async masked hamming A vs B (returns GPU tensors, caller must sync)",
         py::arg("data_a"), py::arg("mask_a"), py::arg("data_b"),
@@ -938,7 +1047,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("include_flags") = INCLUDE_ALL, py::arg("max_pairs") = 1000000,
         py::arg("r_dim") = DEFAULT_R_DIM,
         py::arg("theta_dim") = DEFAULT_THETA_DIM,
-        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM);
+        py::arg("d0_dim") = DEFAULT_D0_DIM, py::arg("d1_dim") = DEFAULT_D1_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("pack_theta_major_cuda", &pack_theta_major_cuda,
         "Pack iris bits to theta-major int32 words (CUDA)", py::arg("bits"),
         py::arg("r_dim") = DEFAULT_R_DIM,
@@ -977,7 +1090,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("is_similarity") = true,
         py::arg("include_flags") = INCLUDE_ALL,
         py::arg("max_pairs") = 1000000,
-        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("dot_product_cuda_async", &dot_product_cuda_async,
         "Async dot product similarity (returns GPU tensors, caller must sync)",
         py::arg("data"),
@@ -987,7 +1104,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("is_similarity") = true,
         py::arg("include_flags") = INCLUDE_ALL,
         py::arg("max_pairs") = 1000000,
-        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("dot_product_ab_cuda", &dot_product_ab_cuda,
         "Dot product similarity between two sets A and B (CUDA, f16)",
         py::arg("data_a"), py::arg("data_b"),
@@ -998,7 +1119,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("is_similarity") = true,
         py::arg("include_flags") = INCLUDE_ALL,
         py::arg("max_pairs") = 1000000,
-        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   m.def("dot_product_ab_cuda_async", &dot_product_ab_cuda_async,
         "Async dot product A vs B (returns GPU tensors, caller must sync)",
         py::arg("data_a"), py::arg("data_b"),
@@ -1009,7 +1134,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("is_similarity") = true,
         py::arg("include_flags") = INCLUDE_ALL,
         py::arg("max_pairs") = 1000000,
-        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM);
+        py::arg("vec_dim") = DEFAULT_DOT_VEC_DIM,
+        py::arg("sampling_num_bins") = 0,
+        py::arg("sampling_thresholds") = py::none(),
+        py::arg("sampling_probabilities") = py::none(),
+        py::arg("sampling_seed") = 0);
   
   // Dense output variants (high performance)
   m.def("dot_product_dense_cuda", [](torch::Tensor data) {
