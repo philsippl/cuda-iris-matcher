@@ -15,6 +15,7 @@ from tests.utils import rotation_aware_hamming_distance
 def _perf_worker(
     device_idx: int,
     m_perf: int,
+    max_pairs: int,
     warmup: int,
     repeats: int,
     start_evt: "mp.synchronize.Event",
@@ -42,7 +43,6 @@ def _perf_worker(
         ).contiguous()
 
         # Warmup (init kernels, caches, allocator).
-        # New interface: use minimal max_pairs for warmup
         for _ in range(max(0, warmup)):
             ih.masked_hamming_cuda(
                 data_perf,
@@ -50,7 +50,7 @@ def _perf_worker(
                 match_threshold=1.0,
                 non_match_threshold=1.0,
                 include_flags=ih.INCLUDE_ALL,
-                max_pairs=1,  # Minimal allocation for warmup
+                max_pairs=max_pairs,
             )
         torch.cuda.synchronize(device)
 
@@ -69,7 +69,7 @@ def _perf_worker(
                 match_threshold=1.0,
                 non_match_threshold=1.0,
                 include_flags=ih.INCLUDE_ALL,
-                max_pairs=1,  # Minimal allocation for perf test
+                max_pairs=max_pairs,
             )
         end_event.record()
         torch.cuda.synchronize(device)
@@ -198,6 +198,7 @@ def main():
     # ----------------- Performance-only check (no NumPy validation) -----------------
     # Run performance test on all visible CUDA devices concurrently and aggregate throughput.
     M_perf = int(os.environ.get("M_PERF", "4096"))
+    max_pairs_perf = int(os.environ.get("MAX_PAIRS", "1"))
     warmup = int(os.environ.get("PERF_WARMUP", "0"))
     repeats = int(os.environ.get("PERF_REPEATS", "1"))
 
@@ -236,7 +237,7 @@ def main():
 
     print(
         f"\nKernel benchmark (concurrent): devices={ndev}, "
-        f"warmup={warmup}, repeats={repeats}"
+        f"max_pairs={max_pairs_perf}, warmup={warmup}, repeats={repeats}"
     )
 
     ctx = mp.get_context("spawn")
@@ -247,7 +248,7 @@ def main():
 
     for di in range(ndev):
         p = ctx.Process(
-            target=_perf_worker, args=(di, M_perf, warmup, repeats, start_evt, ready_q, result_q)
+            target=_perf_worker, args=(di, M_perf, max_pairs_perf, warmup, repeats, start_evt, ready_q, result_q)
         )
         p.start()
         procs.append(p)
