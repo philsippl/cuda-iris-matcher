@@ -148,9 +148,9 @@ masked_hamming_cuda_async(torch::Tensor data, torch::Tensor mask,
   auto premasked = torch::zeros_like(data);
 
   // GPU buffers for kernel output (stay on GPU)
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto distances_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
 
   // Construct sampling config
@@ -225,29 +225,10 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
   auto premasked = torch::zeros_like(data);
 
   // GPU buffers for kernel output
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto distances_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
-
-  // Pinned CPU buffers for async copy
-  auto cpu_opts_int = torch::TensorOptions()
-                          .device(torch::kCPU)
-                          .dtype(torch::kInt32)
-                          .pinned_memory(true);
-  auto cpu_opts_byte = torch::TensorOptions()
-                           .device(torch::kCPU)
-                           .dtype(torch::kUInt8)
-                           .pinned_memory(true);
-  auto cpu_opts_float = torch::TensorOptions()
-                            .device(torch::kCPU)
-                            .dtype(torch::kFloat32)
-                            .pinned_memory(true);
-
-  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
-  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
-  auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
-  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
   // Construct sampling config
   SamplingConfig sampling = make_sampling_config(
@@ -266,18 +247,38 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
-  // Copy count first and sync to know how many pairs to copy
-  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+  // Copy count first to know how many pairs were produced
+  int host_count = 0;
+  cudaMemcpyAsync(&host_count, match_count_gpu.data_ptr<int>(),
                   sizeof(int), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
 
-  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  int64_t actual_count = host_count;
   // Clamp to max_pairs in case kernel wrote more
   if (actual_count > max_pairs) {
     actual_count = max_pairs;
   }
 
-  // Only copy the valid entries
+  // Lazy allocation: allocate pinned CPU buffers only for actual_count (not max_pairs)
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+
+  auto pair_indices_cpu = torch::empty({actual_count, 2}, cpu_opts_int);
+  auto categories_cpu = torch::empty({actual_count}, cpu_opts_byte);
+  auto distances_cpu = torch::empty({actual_count}, cpu_opts_float);
+  auto match_count_cpu = torch::tensor({(int)actual_count}, cpu_opts_int);
+
+  // Copy only the valid entries
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
                     actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost,
@@ -288,14 +289,10 @@ masked_hamming_cuda(torch::Tensor data, torch::Tensor mask,
     cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
                     actual_count * sizeof(float), cudaMemcpyDeviceToHost,
                     stream);
+    cudaStreamSynchronize(stream);
   }
 
-  // Return sliced tensors with only valid entries
-  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
-  auto categories_out = categories_cpu.slice(0, 0, actual_count);
-  auto distances_out = distances_cpu.slice(0, 0, actual_count);
-
-  return {pair_indices_out, categories_out, distances_out, match_count_cpu};
+  return {pair_indices_cpu, categories_cpu, distances_cpu, match_count_cpu};
 }
 
 // Async version: returns GPU tensors without synchronization
@@ -371,9 +368,9 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda_async(
   auto premasked_b = torch::zeros_like(data_b);
 
   // GPU buffers for kernel output (stay on GPU)
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto distances_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
 
   // Construct sampling config
@@ -474,29 +471,10 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
   auto premasked_b = torch::zeros_like(data_b);
 
   // GPU buffers for kernel output
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto distances_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto distances_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
-
-  // Pinned CPU buffers for async copy
-  auto cpu_opts_int = torch::TensorOptions()
-                          .device(torch::kCPU)
-                          .dtype(torch::kInt32)
-                          .pinned_memory(true);
-  auto cpu_opts_byte = torch::TensorOptions()
-                           .device(torch::kCPU)
-                           .dtype(torch::kUInt8)
-                           .pinned_memory(true);
-  auto cpu_opts_float = torch::TensorOptions()
-                            .device(torch::kCPU)
-                            .dtype(torch::kFloat32)
-                            .pinned_memory(true);
-
-  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
-  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
-  auto distances_cpu = torch::zeros({max_pairs}, cpu_opts_float);
-  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
 
   // Construct sampling config
   SamplingConfig sampling = make_sampling_config(
@@ -519,18 +497,38 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
 
-  // Copy count first and sync to know how many pairs to copy
-  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+  // Copy count first to know how many pairs were produced
+  int host_count = 0;
+  cudaMemcpyAsync(&host_count, match_count_gpu.data_ptr<int>(),
                   sizeof(int), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
 
-  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  int64_t actual_count = host_count;
   // Clamp to max_pairs in case kernel wrote more
   if (actual_count > max_pairs) {
     actual_count = max_pairs;
   }
 
-  // Only copy the valid entries
+  // Lazy allocation: allocate pinned CPU buffers only for actual_count (not max_pairs)
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+
+  auto pair_indices_cpu = torch::empty({actual_count, 2}, cpu_opts_int);
+  auto categories_cpu = torch::empty({actual_count}, cpu_opts_byte);
+  auto distances_cpu = torch::empty({actual_count}, cpu_opts_float);
+  auto match_count_cpu = torch::tensor({(int)actual_count}, cpu_opts_int);
+
+  // Copy only the valid entries
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
                     actual_count * 2 * sizeof(int), cudaMemcpyDeviceToHost,
@@ -541,14 +539,10 @@ std::vector<torch::Tensor> masked_hamming_ab_cuda(
     cudaMemcpyAsync(distances_cpu.data_ptr(), distances_gpu.data_ptr(),
                     actual_count * sizeof(float), cudaMemcpyDeviceToHost,
                     stream);
+    cudaStreamSynchronize(stream);
   }
 
-  // Return sliced tensors with only valid entries
-  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
-  auto categories_out = categories_cpu.slice(0, 0, actual_count);
-  auto distances_out = distances_cpu.slice(0, 0, actual_count);
-
-  return {pair_indices_out, categories_out, distances_out, match_count_cpu};
+  return {pair_indices_cpu, categories_cpu, distances_cpu, match_count_cpu};
 }
 
 torch::Tensor pack_theta_major_cuda(torch::Tensor bits, int64_t r_dim,
@@ -671,9 +665,9 @@ dot_product_cuda_async(torch::Tensor data,
       sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
   
   // GPU buffers for output
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto scores_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
   
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -733,29 +727,10 @@ dot_product_cuda(torch::Tensor data,
   SamplingConfig sampling = make_sampling_config(
       sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
   
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto scores_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
-  
-  // Pinned CPU buffers
-  auto cpu_opts_int = torch::TensorOptions()
-                          .device(torch::kCPU)
-                          .dtype(torch::kInt32)
-                          .pinned_memory(true);
-  auto cpu_opts_byte = torch::TensorOptions()
-                           .device(torch::kCPU)
-                           .dtype(torch::kUInt8)
-                           .pinned_memory(true);
-  auto cpu_opts_float = torch::TensorOptions()
-                            .device(torch::kCPU)
-                            .dtype(torch::kFloat32)
-                            .pinned_memory(true);
-  
-  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
-  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
-  auto scores_cpu = torch::zeros({max_pairs}, cpu_opts_float);
-  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
   
   auto stream = at::cuda::getDefaultCUDAStream();
   launch_dot_product_cuda(
@@ -770,15 +745,35 @@ dot_product_cuda(torch::Tensor data,
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
   
-  // Copy count and sync
-  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+  // Copy count first to know how many pairs were produced
+  int host_count = 0;
+  cudaMemcpyAsync(&host_count, match_count_gpu.data_ptr<int>(),
                   sizeof(int), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
   
-  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  int64_t actual_count = host_count;
   if (actual_count > max_pairs) {
     actual_count = max_pairs;
   }
+  
+  // Lazy allocation: allocate pinned CPU buffers only for actual_count
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+  
+  auto pair_indices_cpu = torch::empty({actual_count, 2}, cpu_opts_int);
+  auto categories_cpu = torch::empty({actual_count}, cpu_opts_byte);
+  auto scores_cpu = torch::empty({actual_count}, cpu_opts_float);
+  auto match_count_cpu = torch::tensor({(int)actual_count}, cpu_opts_int);
   
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
@@ -787,13 +782,10 @@ dot_product_cuda(torch::Tensor data,
                     actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(scores_cpu.data_ptr(), scores_gpu.data_ptr(),
                     actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
   }
   
-  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
-  auto categories_out = categories_cpu.slice(0, 0, actual_count);
-  auto scores_out = scores_cpu.slice(0, 0, actual_count);
-  
-  return {pair_indices_out, categories_out, scores_out, match_count_cpu};
+  return {pair_indices_cpu, categories_cpu, scores_cpu, match_count_cpu};
 }
 
 // Async A vs B version
@@ -853,9 +845,9 @@ dot_product_ab_cuda_async(torch::Tensor data_a, torch::Tensor data_b,
   SamplingConfig sampling = make_sampling_config(
       sampling_num_bins, sampling_thresholds, sampling_probabilities, sampling_seed);
   
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto scores_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
   
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -929,28 +921,10 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
                 "labels_b must have shape [M_B]");
   }
   
-  auto pair_indices_gpu = torch::zeros({max_pairs, 2}, opts_int);
-  auto categories_gpu = torch::zeros({max_pairs}, opts_byte);
-  auto scores_gpu = torch::zeros({max_pairs}, opts_float);
+  auto pair_indices_gpu = torch::empty({max_pairs, 2}, opts_int);
+  auto categories_gpu = torch::empty({max_pairs}, opts_byte);
+  auto scores_gpu = torch::empty({max_pairs}, opts_float);
   auto match_count_gpu = torch::zeros({1}, opts_int);
-  
-  auto cpu_opts_int = torch::TensorOptions()
-                          .device(torch::kCPU)
-                          .dtype(torch::kInt32)
-                          .pinned_memory(true);
-  auto cpu_opts_byte = torch::TensorOptions()
-                           .device(torch::kCPU)
-                           .dtype(torch::kUInt8)
-                           .pinned_memory(true);
-  auto cpu_opts_float = torch::TensorOptions()
-                            .device(torch::kCPU)
-                            .dtype(torch::kFloat32)
-                            .pinned_memory(true);
-  
-  auto pair_indices_cpu = torch::zeros({max_pairs, 2}, cpu_opts_int);
-  auto categories_cpu = torch::zeros({max_pairs}, cpu_opts_byte);
-  auto scores_cpu = torch::zeros({max_pairs}, cpu_opts_float);
-  auto match_count_cpu = torch::zeros({1}, cpu_opts_int);
   
   // Construct sampling config
   SamplingConfig sampling = make_sampling_config(
@@ -971,14 +945,35 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
       reinterpret_cast<unsigned int *>(match_count_gpu.data_ptr<int>()),
       (unsigned int)max_pairs, stream);
   
-  cudaMemcpyAsync(match_count_cpu.data_ptr(), match_count_gpu.data_ptr(),
+  // Copy count first to know how many pairs were produced
+  int host_count = 0;
+  cudaMemcpyAsync(&host_count, match_count_gpu.data_ptr<int>(),
                   sizeof(int), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
   
-  int64_t actual_count = match_count_cpu.data_ptr<int>()[0];
+  int64_t actual_count = host_count;
   if (actual_count > max_pairs) {
     actual_count = max_pairs;
   }
+  
+  // Lazy allocation: allocate pinned CPU buffers only for actual_count
+  auto cpu_opts_int = torch::TensorOptions()
+                          .device(torch::kCPU)
+                          .dtype(torch::kInt32)
+                          .pinned_memory(true);
+  auto cpu_opts_byte = torch::TensorOptions()
+                           .device(torch::kCPU)
+                           .dtype(torch::kUInt8)
+                           .pinned_memory(true);
+  auto cpu_opts_float = torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kFloat32)
+                            .pinned_memory(true);
+  
+  auto pair_indices_cpu = torch::empty({actual_count, 2}, cpu_opts_int);
+  auto categories_cpu = torch::empty({actual_count}, cpu_opts_byte);
+  auto scores_cpu = torch::empty({actual_count}, cpu_opts_float);
+  auto match_count_cpu = torch::tensor({(int)actual_count}, cpu_opts_int);
   
   if (actual_count > 0) {
     cudaMemcpyAsync(pair_indices_cpu.data_ptr(), pair_indices_gpu.data_ptr(),
@@ -987,13 +982,10 @@ dot_product_ab_cuda(torch::Tensor data_a, torch::Tensor data_b,
                     actual_count * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(scores_cpu.data_ptr(), scores_gpu.data_ptr(),
                     actual_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
   }
   
-  auto pair_indices_out = pair_indices_cpu.slice(0, 0, actual_count);
-  auto categories_out = categories_cpu.slice(0, 0, actual_count);
-  auto scores_out = scores_cpu.slice(0, 0, actual_count);
-  
-  return {pair_indices_out, categories_out, scores_out, match_count_cpu};
+  return {pair_indices_cpu, categories_cpu, scores_cpu, match_count_cpu};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
