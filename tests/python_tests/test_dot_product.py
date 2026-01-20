@@ -332,7 +332,8 @@ def test_dot_product_dense_ab_output():
 
 def test_dot_product_native_dense_kernel():
     """Test native CUDA dense kernel correctness."""
-    from cuda_iris_matcher import _C
+    from cuda_iris_matcher import get_ops
+    _C = get_ops()
     
     vec_dim = 512
     M = 128

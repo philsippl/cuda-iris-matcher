@@ -15,7 +15,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from . import _C
+from ._jit_compile import get_ops
 from .ops import (
     DEFAULT_D0_DIM,
     DEFAULT_D1_DIM,
@@ -27,6 +27,11 @@ from .ops import (
     pack_theta_major_cuda,
 )
 from .sampling import SampleBinsType, apply_stratified_sampling
+
+
+def _get_C():
+    """Get the compiled CUDA extension module (JIT compiled on first access)."""
+    return get_ops()
 
 
 @dataclass
@@ -642,7 +647,7 @@ def masked_hamming_ab_sharded(
             labels_a_gpu = labels_a.cuda(primary_device) if not labels_a.is_cuda else labels_a
         if labels_b is not None:
             labels_b_gpu = labels_b.cuda(primary_device) if not labels_b.is_cuda else labels_b
-        pair_indices, categories, distances, count = _C.masked_hamming_ab_cuda(
+        pair_indices, categories, distances, count = _get_C().masked_hamming_ab_cuda(
             data_a_gpu, mask_a_gpu, data_b_gpu, mask_b_gpu,
             labels_a_gpu, labels_b_gpu,
             match_threshold, non_match_threshold, is_similarity,
@@ -767,7 +772,7 @@ def masked_hamming_ab_sharded(
                 shard.device_id, non_blocking=True
             )
 
-        indices, categories, distances, count = _C.masked_hamming_ab_cuda_async(
+        indices, categories, distances, count = _get_C().masked_hamming_ab_cuda_async(
             data_a_tile,
             mask_a_tile,
             data_b_tile,
@@ -949,7 +954,7 @@ def masked_hamming_sharded(
         labels_gpu = None
         if labels is not None:
             labels_gpu = labels.cuda(primary_device) if not labels.is_cuda else labels
-        pair_indices, categories, distances, count = _C.masked_hamming_cuda(
+        pair_indices, categories, distances, count = _get_C().masked_hamming_cuda(
             data_gpu, mask_gpu, labels_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, r_dim, theta_dim, d0_dim, d1_dim
@@ -1070,7 +1075,7 @@ def masked_hamming_sharded(
                     shard.device_id, non_blocking=True
                 )
 
-            indices, categories, distances, count = _C.masked_hamming_cuda_async(
+            indices, categories, distances, count = _get_C().masked_hamming_cuda_async(
                 data_a_tile,
                 mask_a_tile,
                 labels_tile,
@@ -1085,7 +1090,7 @@ def masked_hamming_sharded(
                 d1_dim,
             )
         else:
-            indices, categories, distances, count = _C.masked_hamming_ab_cuda_async(
+            indices, categories, distances, count = _get_C().masked_hamming_ab_cuda_async(
                 data_a_tile,
                 mask_a_tile,
                 data_b_tile,
@@ -1576,7 +1581,7 @@ def dot_product_ab_sharded(
         data_b_gpu = data_b.cuda(0) if not data_b.is_cuda else data_b
         labels_a_gpu = labels_a.cuda(0) if labels_a is not None and not labels_a.is_cuda else labels_a
         labels_b_gpu = labels_b.cuda(0) if labels_b is not None and not labels_b.is_cuda else labels_b
-        pair_indices, categories, scores, count = _C.dot_product_ab_cuda(
+        pair_indices, categories, scores, count = _get_C().dot_product_ab_cuda(
             data_a_gpu, data_b_gpu, labels_a_gpu, labels_b_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, vec_dim
@@ -1676,7 +1681,7 @@ def dot_product_ab_sharded(
             labels_a_tile = labels_a_cpu[shard.a_start:shard.a_end].cuda(shard.device_id, non_blocking=True)
             labels_b_tile = labels_b_cpu[shard.b_start:shard.b_end].cuda(shard.device_id, non_blocking=True)
 
-        indices, categories, scores, count = _C.dot_product_ab_cuda_async(
+        indices, categories, scores, count = _get_C().dot_product_ab_cuda_async(
             data_a_tile, data_b_tile,
             labels_a_tile, labels_b_tile,
             match_threshold, non_match_threshold,
@@ -1780,7 +1785,7 @@ def dot_product_sharded(
     if num_devices == 1 and min_shards <= 1 and num_hosts == 1:
         data_gpu = data.cuda(0) if not data.is_cuda else data
         labels_gpu = labels.cuda(0) if labels is not None and not labels.is_cuda else labels
-        pair_indices, categories, scores, count = _C.dot_product_cuda(
+        pair_indices, categories, scores, count = _get_C().dot_product_cuda(
             data_gpu, labels_gpu,
             match_threshold, non_match_threshold, is_similarity,
             include_flags, max_pairs, vec_dim
@@ -1877,7 +1882,7 @@ def dot_product_sharded(
             labels_a_tile = labels_cpu[shard.a_start:shard.a_end].cuda(shard.device_id, non_blocking=True)
             labels_b_tile = labels_cpu[shard.b_start:shard.b_end].cuda(shard.device_id, non_blocking=True)
 
-        indices, categories, scores, count = _C.dot_product_ab_cuda_async(
+        indices, categories, scores, count = _get_C().dot_product_ab_cuda_async(
             data_a_tile, data_b_tile,
             labels_a_tile, labels_b_tile,
             match_threshold, non_match_threshold,

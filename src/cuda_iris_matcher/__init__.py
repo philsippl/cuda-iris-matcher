@@ -1,3 +1,5 @@
+from ._jit_compile import get_ops
+
 from .ops import (
     masked_hamming_cuda,
     masked_hamming_ab_cuda,
@@ -48,6 +50,9 @@ from .sharding import (
 )
 
 __all__ = [
+    # JIT compilation access (for tests/advanced usage)
+    "get_ops",
+    # Main API
     "masked_hamming_cuda",
     "masked_hamming_ab_cuda",
     "pack_theta_major",
