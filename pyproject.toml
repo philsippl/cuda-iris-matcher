@@ -10,7 +10,8 @@ description = "CUDA/TensorCore masked hamming distance for IrisCode (PyTorch ext
 readme = "README.md"
 requires-python = ">=3.9"
 # Runtime dependencies - wide version range for flexibility
-dependencies = ["numpy", "torch>=2.0.0"]
+# ninja is required for JIT compilation of CUDA extension
+dependencies = ["numpy", "torch>=2.0.0", "ninja"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pdoc"]
