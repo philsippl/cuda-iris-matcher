@@ -4,8 +4,13 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from . import _C
+from ._jit_compile import get_ops
 from .sampling import StratifiedSamplingFilter, SampleBinsType
+
+
+def _get_C():
+    """Get the compiled CUDA extension module (JIT compiled on first access)."""
+    return get_ops()
 
 
 def _prepare_sampling_params(
@@ -38,26 +43,26 @@ def _prepare_sampling_params(
     return num_bins, thresholds, probabilities, seed
 
 # Export classification constants from C++ extension
-CATEGORY_TRUE_MATCH = _C.CATEGORY_TRUE_MATCH
-CATEGORY_FALSE_MATCH = _C.CATEGORY_FALSE_MATCH
-CATEGORY_FALSE_NON_MATCH = _C.CATEGORY_FALSE_NON_MATCH
-CATEGORY_TRUE_NON_MATCH = _C.CATEGORY_TRUE_NON_MATCH
+CATEGORY_TRUE_MATCH = _get_C().CATEGORY_TRUE_MATCH
+CATEGORY_FALSE_MATCH = _get_C().CATEGORY_FALSE_MATCH
+CATEGORY_FALSE_NON_MATCH = _get_C().CATEGORY_FALSE_NON_MATCH
+CATEGORY_TRUE_NON_MATCH = _get_C().CATEGORY_TRUE_NON_MATCH
 
-INCLUDE_TM = _C.INCLUDE_TM
-INCLUDE_FM = _C.INCLUDE_FM
-INCLUDE_FNM = _C.INCLUDE_FNM
-INCLUDE_TNM = _C.INCLUDE_TNM
-INCLUDE_ALL = _C.INCLUDE_ALL
+INCLUDE_TM = _get_C().INCLUDE_TM
+INCLUDE_FM = _get_C().INCLUDE_FM
+INCLUDE_FNM = _get_C().INCLUDE_FNM
+INCLUDE_TNM = _get_C().INCLUDE_TNM
+INCLUDE_ALL = _get_C().INCLUDE_ALL
 
 # Export default dimensions
-DEFAULT_R_DIM = _C.DEFAULT_R_DIM
-DEFAULT_THETA_DIM = _C.DEFAULT_THETA_DIM
-DEFAULT_D0_DIM = _C.DEFAULT_D0_DIM
-DEFAULT_D1_DIM = _C.DEFAULT_D1_DIM
+DEFAULT_R_DIM = _get_C().DEFAULT_R_DIM
+DEFAULT_THETA_DIM = _get_C().DEFAULT_THETA_DIM
+DEFAULT_D0_DIM = _get_C().DEFAULT_D0_DIM
+DEFAULT_D1_DIM = _get_C().DEFAULT_D1_DIM
 DEFAULT_DIMS = (DEFAULT_R_DIM, DEFAULT_THETA_DIM, DEFAULT_D0_DIM, DEFAULT_D1_DIM)
 
 # Default vector dimension for dot product
-DEFAULT_DOT_VEC_DIM = _C.DEFAULT_DOT_VEC_DIM
+DEFAULT_DOT_VEC_DIM = _get_C().DEFAULT_DOT_VEC_DIM
 
 
 def dot_product_dense_cuda(data: torch.Tensor) -> torch.Tensor:
@@ -159,7 +164,7 @@ def _ensure_packed(
         if not tensor.is_cuda:
             tensor = tensor.cuda()
         # Clone because pack_theta_major is in-place
-        return _C.pack_theta_major_cuda(tensor.clone(), r_dim, theta_dim, d0_dim, d1_dim)
+        return _get_C().pack_theta_major_cuda(tensor.clone(), r_dim, theta_dim, d0_dim, d1_dim)
     
     raise ValueError(
         f"Invalid tensor shape. Expected packed [M, {k_words}] int32 or "
@@ -272,7 +277,7 @@ def masked_hamming_cuda(
     # Prepare kernel-level sampling parameters
     num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
     
-    pair_indices, categories, distances, count = _C.masked_hamming_cuda(
+    pair_indices, categories, distances, count = _get_C().masked_hamming_cuda(
         data, mask, labels,
         match_threshold, non_match_threshold,
         is_similarity, include_flags, max_pairs,
@@ -393,7 +398,7 @@ def masked_hamming_ab_cuda(
     # Prepare kernel-level sampling parameters
     num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
     
-    pair_indices, categories, distances, count = _C.masked_hamming_ab_cuda(
+    pair_indices, categories, distances, count = _get_C().masked_hamming_ab_cuda(
         data_a, mask_a, data_b, mask_b,
         labels_a, labels_b,
         match_threshold, non_match_threshold,
@@ -449,7 +454,7 @@ def pack_theta_major_cuda(
         >>> print(packed_codes.dtype)  # torch.int32
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
-    return _C.pack_theta_major_cuda(bits, r_dim, theta_dim, d0_dim, d1_dim)
+    return _get_C().pack_theta_major_cuda(bits, r_dim, theta_dim, d0_dim, d1_dim)
 
 
 def repack_to_theta_major_cuda(
@@ -476,7 +481,7 @@ def repack_to_theta_major_cuda(
         New CUDA int32 tensor of shape (M, k_words) packed in theta-major order.
     """
     r_dim, theta_dim, d0_dim, d1_dim = _resolve_dims(dims, r_dim, theta_dim, d0_dim, d1_dim)
-    return _C.repack_to_theta_major_cuda(input, r_dim, theta_dim, d0_dim, d1_dim)
+    return _get_C().repack_to_theta_major_cuda(input, r_dim, theta_dim, d0_dim, d1_dim)
 
 
 # ----------------- Dot Product Similarity Functions -----------------
@@ -568,7 +573,7 @@ def dot_product_cuda(
     # Prepare kernel-level sampling parameters
     num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
     
-    pair_indices, categories, scores, count = _C.dot_product_cuda(
+    pair_indices, categories, scores, count = _get_C().dot_product_cuda(
         data, labels,
         match_threshold, non_match_threshold,
         is_similarity, include_flags, max_pairs, vec_dim,
@@ -660,7 +665,7 @@ def dot_product_ab_cuda(
     # Prepare kernel-level sampling parameters
     num_bins, thresholds, probabilities, seed = _prepare_sampling_params(sample_bins)
     
-    pair_indices, categories, scores, count = _C.dot_product_ab_cuda(
+    pair_indices, categories, scores, count = _get_C().dot_product_ab_cuda(
         data_a, data_b,
         labels_a, labels_b,
         match_threshold, non_match_threshold,
